@@ -1,0 +1,45 @@
+{
+  "id": "com.fiscallink.anaf",
+  "version": "0.1.0",
+  "name": "FiscalLink for ANAF",
+  "icon": "./icons/fiscallink_icon_32.png",
+  "distribution_type": "public",
+  "stripe_api_access_type": "oauth",
+  "allowed_redirect_uris": [
+    "https://stripe-app.autoanaf.ro/oauth/callback"
+  ],
+  "sandbox_install_compatible": true,
+  "permissions": [
+    {
+      "permission": "webhook_write",
+      "purpose": "Creates a webhook endpoint on the merchant's Stripe account so completed checkouts are forwarded to FiscalLink for Romanian ANAF e-invoicing.",
+      "name": "Create webhook endpoints that deliver checkout events to FiscalLink"
+    },
+    {
+      "permission": "checkout_session_read",
+      "purpose": "Reads checkout session details (customer, line items, totals) to generate the EN 16931 / CIUS-RO UBL e-invoice.",
+      "name": "Read checkout sessions to build the e-invoice"
+    }
+  ],
+  "ui_extension": {
+    "views": [
+      {
+        "viewport": "stripe.dashboard.settings",
+        "component": "Setup"
+      }
+    ],
+    "content_security_policy": {
+      "connect-src": [
+        "https://stripe-app.autoanaf.ro/"
+      ],
+      "purpose": "The FiscalLink extension calls the FiscalLink Stripe App backend to save credentials, provision the webhook and report connection status."
+    }
+  },
+  "post_install_action": {
+    "type": "external",
+    "url": "https://stripe-app.autoanaf.ro/installed"
+  },
+  "constants": {
+    "API_BASE": "https://stripe-app.autoanaf.ro"
+  }
+}
