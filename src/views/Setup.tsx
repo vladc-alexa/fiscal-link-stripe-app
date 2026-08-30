@@ -260,3 +260,6 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
 const Dot = ({ ok }: { ok: boolean }) => (
   <Box css={{ color: ok ? 'success' : 'critical', fontWeight: 'bold' }}>●</Box>
 );
+
+// Stripe Apps CLI imports view components as default exports.
+export default Setup;
