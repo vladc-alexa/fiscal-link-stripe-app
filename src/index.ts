@@ -385,6 +385,40 @@ app.get('/installed', (_req, res) => {
     );
 });
 
+// ── Marketplace install page (the "Redirect to your website" target) ──
+// Builds the OAuth 2.0 authorize URL for the app. OAUTH_CLIENT_ID comes from the
+// app's Settings page in the Stripe dashboard (or the external-test links).
+app.get('/install', (_req, res) => {
+  const clientId = process.env.OAUTH_CLIENT_ID || '';
+  const redirectUri = `${APP_URL}/oauth/callback`;
+  if (!clientId) {
+    return res
+      .status(200)
+      .type('html')
+      .send(
+        `<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
+        <h1>FiscalLink for ANAF</h1>
+        <p>Installation is not configured yet (OAUTH_CLIENT_ID missing on the server).</p>
+        </body></html>`,
+      );
+  }
+  const state = `stripe_install_${Date.now()}`;
+  const url = `https://marketplace.stripe.com/oauth/v2/authorize?client_id=${encodeURIComponent(
+    clientId,
+  )}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+  res
+    .status(200)
+    .type('html')
+    .send(
+      `<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
+      <h1>FiscalLink for ANAF</h1>
+      <p>Turn completed Stripe checkouts into Romanian ANAF e-invoices.</p>
+      <p><a href="${url}" style="display:inline-block;background:#533AFD;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold">Install from Stripe</a></p>
+      <p style="color:#666;font-size:14px">You'll be redirected to Stripe to authorize the installation.</p>
+      </body></html>`,
+    );
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
