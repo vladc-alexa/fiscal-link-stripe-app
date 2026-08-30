@@ -5,19 +5,17 @@
  *  1. OAuth 2.0 install flow  — exchange the authorization code for a refresh token,
  *     stored in the Stripe Apps Secret Store (account scope) — never on disk.
  *  2. UI extension API (signed with the app secret):
- *       GET  /api/status      → connection state (OAuth, FiscalLink key, ANAF creds, webhook)
+ *       GET  /api/status      → connection state (OAuth, FiscalLink key, ANAF creds)
  *       POST /api/connect     → validate + store FiscalLink API key and ANAF SPV credentials
- *       POST /api/enable      → provision the checkout webhook endpoint on the merchant account
- *       POST /api/disconnect  → remove secrets + webhook endpoint
- *  3. Stripe webhook receiver (the merchant's webhook endpoint URL) —
- *     turns checkout.session.completed into a FiscalLink invoice (EN 16931 / CIUS-RO UBL)
- *     submitted to ANAF via the core API, using the merchant's FiscalLink API key.
- *  4. Stripe Apps lifecycle webhooks: app.installed / app.uninstalled.
+ *       POST /api/disconnect  → remove secrets
+ *  3. App event receiver (ONE endpoint, developer-configured in the Stripe dashboard
+ *     with "monitor events from connected accounts") — checkout.session.completed
+ *     → FiscalLink invoice (EN 16931 / CIUS-RO UBL) submitted to ANAF via the core API
+ *     using the merchant's FiscalLink API key; account.application.deauthorized → cleanup.
  *
- * Security: every UI→backend call carries a Stripe-Signature header (signed with the app
- * secret); every Stripe→backend call carries the webhook endpoint signature. No secrets
- * are stored locally — only the Stripe developer key in env (which is the platform key,
- * not a merchant secret).
+ * Security: UI→backend calls carry a Stripe-Signature header signed with the APP secret;
+ * Stripe→backend events carry the WEBHOOK endpoint secret. No merchant secrets are stored
+ * locally — only the Stripe developer key in env (the platform key, not a merchant secret).
  */
 import crypto from 'crypto';
 import express from 'express';
@@ -32,6 +30,9 @@ const APP_URL = process.env.APP_URL || 'https://stripe-app.autoanaf.ro';
 const CORE_URL = process.env.FISCALLINK_CORE_URL || 'https://core.autoanaf.ro';
 const STRIPE_APP_SECRET = process.env.STRIPE_APP_SECRET || '';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+// Signing secret of the dashboard-registered webhook endpoint (Developers → Webhooks →
+// "Listen to events on connected accounts"). Stripe signs app events with it.
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 
 // ── Secret Store names (account-scoped) ──────────────────────────────
 const SECRET_REFRESH_TOKEN = 'fiscallink_stripe_refresh_token';
@@ -40,8 +41,6 @@ const SECRET_FISCALLINK_KEY = 'fiscallink_api_key';
 const SECRET_ANAF_CIF = 'fiscallink_anaf_cif';
 const SECRET_ANAF_CLIENT_ID = 'fiscallink_anaf_client_id';
 const SECRET_ANAF_CLIENT_SECRET = 'fiscallink_anaf_client_secret';
-const SECRET_WEBHOOK_ENDPOINT_ID = 'fiscallink_webhook_endpoint_id';
-const SECRET_WEBHOOK_ENDPOINT_SECRET = 'fiscallink_webhook_endpoint_secret';
 
 const app = express();
 app.use(cors());
@@ -248,7 +247,7 @@ app.get('/oauth/callback', async (req, res) => {
     // Persist refresh token + account id in the Secret Store (account scope).
     await setSecret(SECRET_REFRESH_TOKEN, tokens.refresh_token, tokens.stripe_user_id);
     await setSecret(SECRET_ACCOUNT_ID, tokens.stripe_user_id, tokens.stripe_user_id);
-    // state may carry a return path — default to the dashboard app settings.
+    // state may carry a return path — default to the installed landing page.
     const redirect = state && state.startsWith('/') ? state : '/installed?account=' + tokens.stripe_user_id;
     res.redirect(`${APP_URL}${redirect}`);
   } catch (e) {
@@ -260,16 +259,17 @@ app.get('/oauth/callback', async (req, res) => {
 app.get('/api/status', async (req, res) => {
   try {
     const { accountId } = verifyAppSignature(req);
-    const [fiscalLinkKey, cif, webhookEndpointId] = await Promise.all([
+    const [fiscalLinkKey, cif] = await Promise.all([
       findSecret(SECRET_FISCALLINK_KEY, accountId),
       findSecret(SECRET_ANAF_CIF, accountId),
-      findSecret(SECRET_WEBHOOK_ENDPOINT_ID, accountId),
     ]);
     res.json({
       installed: true,
       fiscalLinkConnected: Boolean(fiscalLinkKey),
       anafConfigured: Boolean(cif),
-      webhookEnabled: Boolean(webhookEndpointId),
+      // The checkout webhook is a single developer-configured endpoint (monitors
+      // connected accounts) — always on once the app is installed.
+      webhookEnabled: true,
     });
   } catch (e) {
     res.status(401).json({ error: (e as Error).message });
@@ -304,41 +304,11 @@ app.post('/api/connect', async (req, res) => {
   }
 });
 
-app.post('/api/enable', async (req, res) => {
-  try {
-    const { accountId } = verifyAppSignature(req);
-    const existing = await findSecret(SECRET_WEBHOOK_ENDPOINT_ID, accountId);
-    if (existing) return res.json({ ok: true, webhookEnabled: true, endpointId: existing });
-
-    const sm = await merchantStripe(accountId);
-    const endpoint = await sm.webhookEndpoints.create({
-      url: `${APP_URL}/hooks/stripe`,
-      enabled_events: ['checkout.session.completed', 'checkout.session.expired'],
-    });
-    await setSecret(SECRET_WEBHOOK_ENDPOINT_ID, endpoint.id, accountId);
-    if (endpoint.secret) await setSecret(SECRET_WEBHOOK_ENDPOINT_SECRET, endpoint.secret, accountId);
-    res.json({ ok: true, webhookEnabled: true, endpointId: endpoint.id });
-  } catch (e) {
-    res.status(401).json({ error: (e as Error).message });
-  }
-});
-
 app.post('/api/disconnect', async (req, res) => {
   try {
     const { accountId } = verifyAppSignature(req);
-    // Best-effort cleanup: delete the webhook endpoint, then the secrets.
-    const endpointId = await findSecret(SECRET_WEBHOOK_ENDPOINT_ID, accountId);
-    if (endpointId) {
-      try {
-        const sm = await merchantStripe(accountId);
-        await sm.webhookEndpoints.del(endpointId);
-      } catch {
-        // endpoint may already be gone — ignore
-      }
-    }
     for (const name of [
       SECRET_FISCALLINK_KEY, SECRET_ANAF_CIF, SECRET_ANAF_CLIENT_ID, SECRET_ANAF_CLIENT_SECRET,
-      SECRET_WEBHOOK_ENDPOINT_ID, SECRET_WEBHOOK_ENDPOINT_SECRET,
     ]) {
       await setSecret(name, '', accountId); // empty payload effectively clears it
     }
@@ -348,73 +318,56 @@ app.post('/api/disconnect', async (req, res) => {
   }
 });
 
-// ── 3. Merchant webhook receiver (checkout events) ────────────────────
-// This is the packaged "existing webhook listener": checkout.session.completed
-// → FiscalLink invoice creation + ANAF submission via the merchant's API key.
-app.post('/hooks/stripe', async (req, res) => {
+// ── 3. App event receiver (connected accounts) ────────────────────────
+// One endpoint, registered in the DEVELOPER's Stripe dashboard with
+// "Listen to events on connected accounts". Events carry the merchant's account id
+// in the event `account` property. checkout.session.completed → FiscalLink invoice.
+app.post('/hooks/app', async (req, res) => {
   try {
-    const accountId = (req.headers['stripe-account'] as string) || '';
-    const endpointSecret = await findSecret(SECRET_WEBHOOK_ENDPOINT_SECRET, accountId);
-    if (!endpointSecret) throw new Error('Webhook not provisioned for this account');
-
+    if (!STRIPE_WEBHOOK_SECRET) throw new Error('STRIPE_WEBHOOK_SECRET not configured');
     const sig = (req.headers['stripe-signature'] as string) || '';
     const raw = ((req as express.Request & { rawBody?: Buffer }).rawBody || Buffer.from('')).toString('utf8');
-    const event = stripe.webhooks.constructEvent(raw, sig, endpointSecret);
+    const event = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET);
+
+    const merchantAccountId = (event as Stripe.Event & { account?: string }).account || '';
+    if (!merchantAccountId) throw new Error('Event missing account (connected merchant)');
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session;
-      const apiKey = await findSecret(SECRET_FISCALLINK_KEY, accountId);
-      const cif = await findSecret(SECRET_ANAF_CIF, accountId);
-      if (!apiKey) throw new Error('FiscalLink API key not configured');
+      const apiKey = await findSecret(SECRET_FISCALLINK_KEY, merchantAccountId);
+      const cif = await findSecret(SECRET_ANAF_CIF, merchantAccountId);
+      if (!apiKey) {
+        console.error(`checkout.session.completed for ${merchantAccountId}: FiscalLink API key not configured`);
+        return res.json({ received: true, skipped: 'no-api-key' });
+      }
+      // Fetch the session expanded (webhook events are not expanded).
+      const sm = await merchantStripe(merchantAccountId);
+      const full = await sm.checkout.sessions.retrieve(session.id, {
+        expand: ['line_items', 'customer'],
+      });
       const issuer = {
         name: session.metadata?.merchant_name || 'Stripe merchant',
         vatNumber: cif || undefined,
       };
-      // Expand line items — the webhook event carries them expanded if requested
-      // at endpoint creation; otherwise we fetch the session fresh.
-      const sm = await merchantStripe(accountId);
-      const full = await sm.checkout.sessions.retrieve(session.id, {
-        expand: ['line_items', 'customer'],
-      });
       const invoice = mapCheckoutToInvoice(full, issuer);
       const result = await submitInvoiceToFiscalLink(apiKey, invoice);
       if (!result.ok) {
-        console.error(`FiscalLink submission failed (${result.status}) for ${session.id}`);
+        console.error(`FiscalLink submission failed (${result.status}) for ${session.id}:`,
+          JSON.stringify(result.body).slice(0, 300));
       }
+    } else if (event.type === 'account.application.deauthorized') {
+      // App uninstalled — clear merchant secrets.
+      for (const name of [
+        SECRET_FISCALLINK_KEY, SECRET_ANAF_CIF, SECRET_ANAF_CLIENT_ID, SECRET_ANAF_CLIENT_SECRET,
+        SECRET_REFRESH_TOKEN, SECRET_ACCOUNT_ID,
+      ]) {
+        await setSecret(name, '', merchantAccountId);
+      }
+      console.log(`App deauthorized for ${merchantAccountId} — secrets cleared`);
     }
     res.json({ received: true });
   } catch (e) {
-    console.error('Webhook error:', (e as Error).message);
-    res.status(400).json({ error: (e as Error).message });
-  }
-});
-
-// ── 4. Stripe Apps lifecycle webhooks ─────────────────────────────────
-// Stripe Apps platform calls these on install/uninstall (app secret signed).
-app.post('/hooks/app', async (req, res) => {
-  try {
-    const event = stripe.webhooks.constructEvent(
-      ((req as express.Request & { rawBody?: Buffer }).rawBody || Buffer.from('')).toString('utf8'),
-      (req.headers['stripe-signature'] as string) || '',
-      STRIPE_APP_SECRET,
-    );
-    // App lifecycle events (app.installed / app.uninstalled) are not part of the
-    // Stripe.Event literal union — compare via string cast.
-    const type = event.type as unknown as string;
-    if (type === 'app.uninstalled') {
-      const accountId = ((event.data?.object as { account_id?: string } | undefined)?.account_id) || '';
-      if (accountId) {
-        const endpointId = await findSecret(SECRET_WEBHOOK_ENDPOINT_ID, accountId);
-        if (endpointId) {
-          try {
-            const sm = await merchantStripe(accountId);
-            await sm.webhookEndpoints.del(endpointId);
-          } catch { /* already gone */ }
-        }
-      }
-    }
-    res.json({ received: true });
-  } catch (e) {
+    console.error('App event error:', (e as Error).message);
     res.status(400).json({ error: (e as Error).message });
   }
 });
@@ -427,8 +380,8 @@ app.get('/installed', (_req, res) => {
     .send(
       `<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
       <h1>FiscalLink for ANAF — installed ✅</h1>
-      <p>Open <strong>Settings → Installed apps → FiscalLink for ANAF</strong> in the Stripe
-      dashboard to connect your FiscalLink API key and ANAF SPV credentials.</p></body></html>`,
+      <p>Open the FiscalLink app in your Stripe dashboard (top-right Apps icon) to connect
+      your FiscalLink API key and ANAF SPV credentials.</p></body></html>`,
     );
 });
 

@@ -21,8 +21,8 @@
   "extensions": null,
   "permissions": [
     {
-      "permission": "webhook_write",
-      "purpose": "Creates a webhook endpoint on the merchant's Stripe account so completed checkouts are forwarded to FiscalLink for Romanian ANAF e-invoicing."
+      "permission": "event_read",
+      "purpose": "Receives app events (checkout.session.completed) from connected merchant accounts to trigger Romanian ANAF e-invoicing."
     },
     {
       "permission": "checkout_session_read",

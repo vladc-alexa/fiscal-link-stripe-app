@@ -75,19 +75,6 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
     }
   };
 
-  const handleEnableWebhook = async () => {
-    setSaving(true);
-    setActionError('');
-    try {
-      await signedRequest('/api/enable', userContext, {});
-      await loadStatus();
-    } catch (e) {
-      setActionError((e as Error).message);
-    } finally {
-      setSaving(false);
-    }
-  };
-
   const handleDisconnect = async () => {
     setSaving(true);
     setActionError('');
@@ -215,12 +202,7 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
       <Box css={{ marginTop: 'xsmall' }}>
         <Inline>
           <Dot ok={status.webhookEnabled} />
-          <Box>
-            Checkout webhook:{' '}
-            {status.webhookEnabled
-              ? 'enabled — invoices are generated automatically'
-              : 'not enabled'}
-          </Box>
+          <Box>Checkout webhook: enabled — invoices are generated automatically</Box>
         </Inline>
       </Box>
 
@@ -234,15 +216,6 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
 
       <Box css={{ marginTop: 'medium' }}>
         <Inline>
-          {!status.webhookEnabled && (
-            <Button
-              type="primary"
-              onPress={() => void handleEnableWebhook()}
-              disabled={saving}
-            >
-              {saving ? 'Enabling…' : 'Enable checkout webhook'}
-            </Button>
-          )}
           <Button onPress={() => void handleDisconnect()} disabled={saving}>
             Disconnect
           </Button>

@@ -8,10 +8,10 @@ becomes a Romanian ANAF e-invoice (EN 16931 / CIUS-RO UBL) submitted to the SPV.
 
 ```
 Stripe checkout.session.completed
-        │  (webhook endpoint on the merchant's account)
+        │  (ONE developer-configured webhook endpoint, "listen to connected accounts")
         ▼
-App backend  /hooks/stripe  (this repo, self-hosted)
-        │  verifies Stripe signature with the endpoint secret (Secret Store)
+App backend  /hooks/app  (this repo, self-hosted)
+        │  verifies signature (endpoint secret) · identifies merchant via event.account
         ▼
 FiscalLink core  POST /v1/invoices  (merchant's FiscalLink API key from Secret Store)
         │  UBL generation + ANAF submission + answer polling + quota/metering
@@ -19,13 +19,18 @@ FiscalLink core  POST /v1/invoices  (merchant's FiscalLink API key from Secret S
 ANAF SPV
 ```
 
+**Event delivery model:** public Stripe Apps don't create webhooks on merchant accounts
+(`webhook_write` is disallowed). Instead the developer registers ONE webhook endpoint in
+their own dashboard with **"Listen to events on connected accounts"**; every event carries
+the merchant's account id, which the backend uses to scope the Secret Store lookup.
+
 ## Structure
 
 | Path | Purpose |
 |---|---|
-| `stripe-app.json` | v1 app manifest — public distribution, OAuth 2.0, settings view |
-| `src/index.ts` | Express backend: OAuth callback, signed UI API, webhook receivers, Secret Store access |
-| `src/views/Setup.tsx` | Dashboard settings view (loading / error / empty / connected states) |
+| `stripe-app.json` | v1/v2 app manifest — public distribution, OAuth 2.0, drawer view |
+| `src/index.ts` | Express backend: OAuth callback, signed UI API, app event receiver, Secret Store access |
+| `src/views/Setup.tsx` | Dashboard drawer view (loading / error / empty / connected states) |
 | `src/helpers/backend.ts` | Signed fetch helper (`fetchStripeSignature`) for UI → backend calls |
 | `icons/fiscallink_icon_32.png` | 300×300 app icon |
 
@@ -34,12 +39,10 @@ ANAF SPV
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /oauth/callback` | OAuth code | Exchange code → refresh token; store in Secret Store (account scope) |
-| `GET /api/status` | app signature | Connection state: OAuth / FiscalLink key / ANAF creds / webhook |
+| `GET /api/status` | app signature | Connection state: OAuth / FiscalLink key / ANAF creds |
 | `POST /api/connect` | app signature | Validate + store FiscalLink API key + ANAF SPV creds (Secret Store) |
-| `POST /api/enable` | app signature | Provision the checkout webhook endpoint on the merchant account |
-| `POST /api/disconnect` | app signature | Remove webhook endpoint + secrets |
-| `POST /hooks/stripe` | webhook secret | checkout.session.completed → FiscalLink invoice + ANAF submission |
-| `POST /hooks/app` | app signature | `app.installed` / `app.uninstalled` lifecycle cleanup |
+| `POST /api/disconnect` | app signature | Remove secrets |
+| `POST /hooks/app` | webhook secret | checkout.session.completed → FiscalLink invoice + ANAF submission; account.application.deauthorized → cleanup |
 
 No merchant secrets touch disk or the app's own DB — everything goes through
 `POST /v1/apps/secrets` / `GET /v1/apps/secrets/find` (account scope).
