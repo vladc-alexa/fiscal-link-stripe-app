@@ -5,8 +5,8 @@
   "description": "FiscalLink for ANAF — Stripe App that turns completed checkouts into Romanian ANAF e-invoices (EN 16931 / CIUS-RO UBL).",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
-    "build": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
