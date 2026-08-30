@@ -7,7 +7,7 @@
   "ui_extension": {
     "views": [
       {
-        "viewport": "stripe.dashboard.settings",
+        "viewport": "stripe.dashboard.drawer.default",
         "component": "Setup"
       }
     ],
