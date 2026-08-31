@@ -421,6 +421,9 @@ app.get('/install', (_req, res) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+// Root → marketplace install page (the public domain's landing).
+app.get('/', (_req, res) => res.redirect('/install'));
+
 app.listen(PORT, () => {
   console.log(`FiscalLink Stripe App backend listening on :${PORT}`);
 });
