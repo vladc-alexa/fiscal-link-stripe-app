@@ -2,7 +2,7 @@
   "$schema": "https://stripe.com/stripe-app.schema.json",
   "id": "com.fiscallink.anaf",
   "name": "FiscalLink for ANAF",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "icon": "./icons/fiscallink_icon_32.png",
   "ui_extension": {
     "views": [
@@ -27,6 +27,10 @@
     {
       "permission": "checkout_session_read",
       "purpose": "Reads checkout session details (customer, line items, totals) to generate the EN 16931 / CIUS-RO UBL e-invoice."
+    },
+    {
+      "permission": "secret_write",
+      "purpose": "Stores the merchant's OAuth refresh token, FiscalLink API key and ANAF SPV credentials in the Stripe Secret Store (account scope)."
     }
   ],
   "post_install_action": {
