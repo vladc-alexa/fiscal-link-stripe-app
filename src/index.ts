@@ -283,15 +283,19 @@ app.post('/api/connect', async (req, res) => {
   try {
     const { accountId } = verifyAppSignature(req);
     const { apiKey, anafCif, anafClientId, anafClientSecret } = req.body ?? {};
+    console.log(`[connect] account=${accountId} hasApiKey=${Boolean(apiKey)} cif=${anafCif ?? ''}`);
 
     if (!apiKey || typeof apiKey !== 'string') {
       return res.status(400).json({ error: 'apiKey is required' });
     }
 
     // Validate the key against FiscalLink core before storing anything.
+    const probeCtl = AbortSignal.timeout(10000);
     const probe = await fetch(`${CORE_URL}/v1/keys`, {
       headers: { Authorization: `Bearer ${apiKey}` },
+      signal: probeCtl,
     });
+    console.log(`[connect] core probe status=${probe.status}`);
     if (probe.status === 401 || probe.status === 403) {
       return res.status(400).json({ error: 'FiscalLink API key is invalid or inactive' });
     }
@@ -301,8 +305,10 @@ app.post('/api/connect', async (req, res) => {
     if (anafClientId) await setSecret(SECRET_ANAF_CLIENT_ID, String(anafClientId), accountId);
     if (anafClientSecret) await setSecret(SECRET_ANAF_CLIENT_SECRET, String(anafClientSecret), accountId);
 
+    console.log(`[connect] secrets stored for ${accountId}`);
     res.json({ ok: true });
   } catch (e) {
+    console.error(`[connect] failed: ${(e as Error).message}`);
     res.status(401).json({ error: (e as Error).message });
   }
 });
