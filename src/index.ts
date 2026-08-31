@@ -262,10 +262,12 @@ app.get('/oauth/callback', async (req, res) => {
 app.post('/api/status', async (req, res) => {
   try {
     const { accountId } = verifyAppSignature(req);
+    console.log(`[status] account=${accountId}`);
     const [fiscalLinkKey, cif] = await Promise.all([
       findSecret(SECRET_FISCALLINK_KEY, accountId),
       findSecret(SECRET_ANAF_CIF, accountId),
     ]);
+    console.log(`[status] key=${Boolean(fiscalLinkKey)} cif=${Boolean(cif)}`);
     res.json({
       installed: true,
       fiscalLinkConnected: Boolean(fiscalLinkKey),
