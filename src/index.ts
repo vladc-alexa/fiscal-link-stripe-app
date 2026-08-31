@@ -92,21 +92,24 @@ async function findSecret(name: string, accountId?: string): Promise<string | nu
 }
 
 // ── Signature verification for UI-extension → backend calls ───────────
-// The UI signs every request with fetchStripeSignature() using the app secret.
+// App-embedded signatures (fetchStripeSignature) cover exactly the string
+// `{"user_id":...,"account_id":...}` (field order matters) — verify with
+// verifyHeader, NOT constructEvent (that one is for real webhook events).
 function verifyAppSignature(req: express.Request): { accountId: string; userId: string } {
   const sig = (req.headers['stripe-signature'] as string) || '';
   if (!sig) throw new Error('Missing Stripe-Signature header');
-  const raw = ((req as express.Request & { rawBody?: Buffer }).rawBody || Buffer.from('')).toString('utf8');
-  let event: Stripe.Event;
+  const body = (req.body ?? {}) as { user_id?: string; account_id?: string };
+  if (!body.user_id || !body.account_id) {
+    throw new Error('Missing user_id/account_id in signed request');
+  }
+  const payload = JSON.stringify({ user_id: body.user_id, account_id: body.account_id });
   try {
-    event = stripe.webhooks.constructEvent(raw, sig, STRIPE_APP_SECRET);
+    if (!stripe.webhooks.signature) throw new Error('verifyHeader unavailable');
+    stripe.webhooks.signature.verifyHeader(payload, sig, STRIPE_APP_SECRET);
   } catch (e) {
     throw new Error(`Signature verification failed: ${(e as Error).message}`);
   }
-  // App requests carry account/user context in the event data.
-  const data = event.data?.object as { account_id?: string; user_id?: string };
-  if (!data?.account_id) throw new Error('Missing account_id in signed request');
-  return { accountId: data.account_id, userId: data.user_id || '' };
+  return { accountId: body.account_id, userId: body.user_id };
 }
 
 // ── OAuth helpers ─────────────────────────────────────────────────────
@@ -256,7 +259,7 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 // ── 2. UI extension API (signed) ──────────────────────────────────────
-app.get('/api/status', async (req, res) => {
+app.post('/api/status', async (req, res) => {
   try {
     const { accountId } = verifyAppSignature(req);
     const [fiscalLinkKey, cif] = await Promise.all([
@@ -386,11 +389,15 @@ app.get('/installed', (_req, res) => {
 });
 
 // ── Marketplace install page (the "Redirect to your website" target) ──
-// Builds the OAuth 2.0 authorize URL for the app. OAUTH_CLIENT_ID comes from the
-// app's Settings page in the Stripe dashboard (or the external-test links).
+// Before publication Stripe accepts only its full, generated external-test link.
+// Keep that URL verbatim rather than trying to reconstruct it from a client ID.
 app.get('/install', (_req, res) => {
+  const installUrl = process.env.STRIPE_INSTALL_URL || '';
   const clientId = process.env.OAUTH_CLIENT_ID || '';
   const redirectUri = `${APP_URL}/oauth/callback`;
+  if (installUrl) {
+    return res.redirect(302, installUrl);
+  }
   if (!clientId) {
     return res
       .status(200)
@@ -398,12 +405,11 @@ app.get('/install', (_req, res) => {
       .send(
         `<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
         <h1>FiscalLink for ANAF</h1>
-        <p>Installation is not configured yet (OAUTH_CLIENT_ID missing on the server).</p>
+        <p>Installation is not configured yet (STRIPE_INSTALL_URL missing on the server).</p>
         </body></html>`,
       );
   }
-  // NOTE: no `state` param — Stripe's own generated test links carry none, and
-  // adding one triggered "The provided OAuth link is invalid" on some accounts.
+  // This fallback works only after Stripe publishes the Marketplace listing.
   const url = `https://marketplace.stripe.com/oauth/v2/authorize?client_id=${encodeURIComponent(
     clientId,
   )}&redirect_uri=${encodeURIComponent(redirectUri)}`;

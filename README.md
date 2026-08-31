@@ -79,9 +79,11 @@ generates the **App secret** used by `fetchStripeSignature` and backend verifica
 1. `stripe apps submit` from the CLI.
 2. Provide: tagline (≤60 chars), description, category, support email/URL, privacy URL,
    screenshots of the settings view (all four states).
-3. Public install URL must be a page with the OAuth install link:
-   `https://marketplace.stripe.com/oauth/v2/authorize?client_id=<clientId>&redirect_uri=<callback>&state=<token>`
-   (live-mode link from the app's **Settings** tab).
+3. While the listing is under review, set `STRIPE_INSTALL_URL` to the full **Copy test
+   link** URL from the app's live-mode **Details → External testing** page. Do not
+   construct this URL from `client_id`: Stripe rejects public OAuth links until the
+   app is published. After publication, `/install` can fall back to the public OAuth
+   URL built from `OAUTH_CLIENT_ID`.
 4. Name restrictions: no "Stripe", "App", "free"/"paid" in the display name
    ("FiscalLink for ANAF" is fine).
 5. Review notes: the app only reads checkout sessions + writes one webhook endpoint;

@@ -13,7 +13,7 @@ export {
  };
 
 // Timestamp changes on every export, ensuring the dev server detects a rebuild
-export const BUILD_TIME = '2026-08-30 11:34:17.941852568 +0000 UTC m=+4.763520947';
+export const BUILD_TIME = '2026-08-31 15:48:20.304079147 +0000 UTC m=+0.918313877';
 
 // App manifest — consumed by the Dashboard to configure the app
 export default {
@@ -30,12 +30,16 @@ export default {
   "name": "FiscalLink for ANAF",
   "permissions": [
     {
-      "permission": "webhook_write",
-      "purpose": "Creates a webhook endpoint on the merchant's Stripe account so completed checkouts are forwarded to FiscalLink for Romanian ANAF e-invoicing."
+      "permission": "event_read",
+      "purpose": "Receives app events (checkout.session.completed) from connected merchant accounts to trigger Romanian ANAF e-invoicing."
     },
     {
       "permission": "checkout_session_read",
       "purpose": "Reads checkout session details (customer, line items, totals) to generate the EN 16931 / CIUS-RO UBL e-invoice."
+    },
+    {
+      "permission": "secret_write",
+      "purpose": "Stores the merchant's OAuth refresh token, FiscalLink API key and ANAF SPV credentials in the Stripe Secret Store (account scope)."
     }
   ],
   "post_install_action": {
@@ -58,5 +62,5 @@ export default {
       }
     ]
   },
-  "version": "0.1.0"
+  "version": "0.1.1"
 };

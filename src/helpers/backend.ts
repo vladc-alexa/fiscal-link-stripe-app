@@ -17,20 +17,21 @@ export async function signedRequest<T = unknown>(
   userContext: UserContext,
   body?: Record<string, unknown>,
 ): Promise<T> {
+  // App-embedded signatures cover exactly {user_id, account_id} — always include
+  // BOTH (field order matters) and always POST, so the backend has a body to verify.
   const signaturePayload = {
+    user_id: userContext.id,
     account_id: userContext.account.id,
-    // Omit user_id when it matches the account id (signed payload rule).
-    user_id: userContext.account.id === userContext.id ? undefined : userContext.id,
   };
   const signature = await fetchStripeSignature();
   const payload = { ...signaturePayload, ...(body ?? {}) };
   const res = await fetch(`${API_BASE}${path}`, {
-    method: body ? 'POST' : 'GET',
+    method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Stripe-Signature': signature,
     },
-    body: body ? JSON.stringify(payload) : undefined,
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const err = (await res.json().catch(() => ({}))) as { error?: string };
