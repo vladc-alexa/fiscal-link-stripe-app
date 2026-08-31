@@ -402,10 +402,11 @@ app.get('/install', (_req, res) => {
         </body></html>`,
       );
   }
-  const state = `stripe_install_${Date.now()}`;
+  // NOTE: no `state` param — Stripe's own generated test links carry none, and
+  // adding one triggered "The provided OAuth link is invalid" on some accounts.
   const url = `https://marketplace.stripe.com/oauth/v2/authorize?client_id=${encodeURIComponent(
     clientId,
-  )}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+  )}&redirect_uri=${encodeURIComponent(redirectUri)}`;
   res
     .status(200)
     .type('html')
