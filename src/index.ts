@@ -81,8 +81,10 @@ async function setSecret(name: string, payload: string, accountId?: string) {
 async function findSecret(name: string, accountId?: string): Promise<string | null> {
   const headers: Record<string, string> = { Authorization: `Bearer ${STRIPE_SECRET_KEY}` };
   if (accountId) headers['Stripe-Account'] = accountId;
+  // payload is expandable — without expand[]=payload the response omits it and
+  // every read returns null despite a successful write (field-verified 2026-08-31).
   const res = await fetch(
-    `https://api.stripe.com/v1/apps/secrets/find?name=${encodeURIComponent(name)}&scope[type]=account`,
+    `https://api.stripe.com/v1/apps/secrets/find?name=${encodeURIComponent(name)}&scope[type]=account&expand[]=payload`,
     { headers },
   );
   if (res.status === 404) return null;
