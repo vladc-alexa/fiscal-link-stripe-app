@@ -1,6 +1,6 @@
 {
   "name": "fiscal-link-stripe-app",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "private": true,
   "description": "FiscalLink for ANAF — Stripe App that turns completed checkouts into Romanian ANAF e-invoices (EN 16931 / CIUS-RO UBL).",
   "scripts": {

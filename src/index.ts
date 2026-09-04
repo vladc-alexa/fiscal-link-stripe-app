@@ -30,6 +30,16 @@ const APP_URL = process.env.APP_URL || 'https://stripe-app.autoanaf.ro';
 const CORE_URL = process.env.FISCALLINK_CORE_URL || 'https://core.autoanaf.ro';
 const STRIPE_APP_SECRET = process.env.STRIPE_APP_SECRET || '';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+// Optional alternate-mode developer key. OAuth authorization codes are mode-bound:
+// a code minted by a TEST-mode install link can ONLY be exchanged with a test key
+// (and a live-mode code only with a live key) — a mismatch 400s with `invalid_grant
+// … livemode API key but authorization code only supports returning test keys`.
+// Stripe's review team installs apps in TEST mode, so during a review cycle the
+// backend must accept test-mode codes even if the deployment's primary key is live
+// (or vice versa). When one of these is set and the primary key is the other mode,
+// the OAuth callback retries the exchange with the correct-mode key automatically.
+const STRIPE_SECRET_KEY_TEST = process.env.STRIPE_SECRET_KEY_TEST || '';
+const STRIPE_SECRET_KEY_LIVE = process.env.STRIPE_SECRET_KEY_LIVE || '';
 // Signing secret of the dashboard-registered webhook endpoint (Developers → Webhooks →
 // "Listen to events on connected accounts"). Stripe signs app events with it.
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
@@ -60,13 +70,14 @@ const stripe = new Stripe(STRIPE_SECRET_KEY || 'sk_placeholder');
 
 // ── Secret Store helpers (Stripe Apps Secret Store API) ───────────────
 // Docs: https://docs.stripe.com/api/apps/secret_store
-async function setSecret(name: string, payload: string, accountId?: string) {
+async function setSecret(name: string, payload: string, accountId?: string, apiKey?: string) {
+  const key = apiKey || STRIPE_SECRET_KEY;
   const form = new URLSearchParams();
   form.set('name', name);
   form.set('payload', payload);
   form.set('scope[type]', 'account');
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+    Authorization: `Bearer ${key}`,
   };
   if (accountId) headers['Stripe-Account'] = accountId;
   const res = await fetch('https://api.stripe.com/v1/apps/secrets', {
@@ -78,8 +89,8 @@ async function setSecret(name: string, payload: string, accountId?: string) {
   return res.json();
 }
 
-async function findSecret(name: string, accountId?: string): Promise<string | null> {
-  const headers: Record<string, string> = { Authorization: `Bearer ${STRIPE_SECRET_KEY}` };
+async function findSecret(name: string, accountId?: string, apiKey?: string): Promise<string | null> {
+  const headers: Record<string, string> = { Authorization: `Bearer ${apiKey || STRIPE_SECRET_KEY}` };
   if (accountId) headers['Stripe-Account'] = accountId;
   // payload is expandable — without expand[]=payload the response omits it and
   // every read returns null despite a successful write (field-verified 2026-08-31).
@@ -115,25 +126,66 @@ function verifyAppSignature(req: express.Request): { accountId: string; userId: 
 }
 
 // ── OAuth helpers ─────────────────────────────────────────────────────
-async function exchangeCode(code: string) {
+interface OAuthTokens {
+  access_token: string;
+  refresh_token: string;
+  stripe_user_id: string;
+  livemode: boolean;
+}
+
+function isModeMismatchError(message: string): boolean {
+  // Stripe rejects the exchange when the API key's mode doesn't match the
+  // authorization code's mode, e.g.:
+  //   "Passed in livemode API key but authorization code only supports
+  //    returning test keys"
+  return /invalid_grant/.test(message) && /livemode|test keys|live keys|mode mismatch/i.test(message);
+}
+
+async function exchangeCode(code: string, apiKey: string): Promise<OAuthTokens> {
   const form = new URLSearchParams();
   form.set('code', code);
   form.set('grant_type', 'authorization_code');
   const res = await fetch('https://api.stripe.com/v1/oauth/token', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: form,
   });
   if (!res.ok) throw new Error(`OAuth token exchange failed: ${res.status} ${await res.text()}`);
-  return res.json() as Promise<{
-    access_token: string;
-    refresh_token: string;
-    stripe_user_id: string;
-    livemode: boolean;
-  }>;
+  return res.json() as Promise<OAuthTokens>;
+}
+
+/**
+ * Exchange an authorization code with the mode-appropriate developer key.
+ * The code's mode is fixed by the install link the user clicked and only an API
+ * key of the SAME mode can exchange it. Try the deployment's primary key first;
+ * if Stripe reports a test/live key mismatch, retry once with the other mode's
+ * key (when configured) so both test-mode review installs and live marketplace
+ * installs complete regardless of which key the deployment primarily runs.
+ */
+async function exchangeCodeWithFallback(code: string): Promise<{ tokens: OAuthTokens; apiKey: string }> {
+  const primaryIsLive = STRIPE_SECRET_KEY.startsWith('sk_live');
+  const primaryIsTest = STRIPE_SECRET_KEY.startsWith('sk_test');
+  const altKey = primaryIsLive ? STRIPE_SECRET_KEY_TEST : primaryIsTest ? STRIPE_SECRET_KEY_LIVE : '';
+  const attempts = [STRIPE_SECRET_KEY, altKey].filter((k) => k.length > 0);
+  let lastError: Error | null = null;
+  for (const apiKey of attempts) {
+    try {
+      const tokens = await exchangeCode(code, apiKey);
+      return { tokens, apiKey };
+    } catch (e) {
+      lastError = e as Error;
+      // Only a mode mismatch is worth retrying — an expired or already-used code
+      // fails identically on both keys, so stop rather than burn the retry.
+      if (!isModeMismatchError(lastError.message)) break;
+      console.log(
+        `[oauth] exchange with the ${apiKey.startsWith('sk_test') ? 'test' : 'live'} key hit a mode mismatch — retrying with the other mode's key`,
+      );
+    }
+  }
+  throw lastError ?? new Error('OAuth token exchange failed: no API key configured');
 }
 
 async function refreshAccessToken(refreshToken: string) {
@@ -248,10 +300,12 @@ app.get('/oauth/callback', async (req, res) => {
     const code = req.query.code as string;
     const state = req.query.state as string;
     if (!code) throw new Error('Missing authorization code');
-    const tokens = await exchangeCode(code);
-    // Persist refresh token + account id in the Secret Store (account scope).
-    await setSecret(SECRET_REFRESH_TOKEN, tokens.refresh_token, tokens.stripe_user_id);
-    await setSecret(SECRET_ACCOUNT_ID, tokens.stripe_user_id, tokens.stripe_user_id);
+    const { tokens, apiKey } = await exchangeCodeWithFallback(code);
+    // Persist refresh token + account id in the Secret Store (account scope) using
+    // the SAME-mode developer key — Secret Store scopes are mode-bound like OAuth.
+    console.log(`[oauth] code exchanged → account ${tokens.stripe_user_id} (livemode=${tokens.livemode})`);
+    await setSecret(SECRET_REFRESH_TOKEN, tokens.refresh_token, tokens.stripe_user_id, apiKey);
+    await setSecret(SECRET_ACCOUNT_ID, tokens.stripe_user_id, tokens.stripe_user_id, apiKey);
     // state may carry a return path — default to the installed landing page.
     const redirect = state && state.startsWith('/') ? state : '/installed?account=' + tokens.stripe_user_id;
     res.redirect(`${APP_URL}${redirect}`);
