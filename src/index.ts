@@ -54,6 +54,19 @@ const SECRET_ANAF_CLIENT_SECRET = 'fiscallink_anaf_client_secret';
 
 const app = express();
 app.use(cors());
+// Request logging: leaves a forensic trail (method, path, status, latency, IP, UA)
+// for support/review investigations — e.g. Stripe's app-review installs.
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    const ua = (req.get('user-agent') || '').replace(/\s+/g, ' ').slice(0, 140);
+    console.log(
+      `${new Date().toISOString()} ${req.method} ${req.originalUrl} ${res.statusCode} ` +
+        `${Date.now() - startedAt}ms ip=${req.ip || '-'} ua="${ua}"`,
+    );
+  });
+  next();
+});
 // Capture the exact raw bytes for signature verification (JSON.stringify(req.body)
 // can reorder keys/whitespace and break Stripe signature checks).
 app.use(
