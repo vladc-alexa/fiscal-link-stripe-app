@@ -169,19 +169,25 @@ async function webhookEndpointHealthy(): Promise<boolean> {
 // App-embedded signatures (fetchStripeSignature) cover exactly the string
 // `{"user_id":...,"account_id":...}` (field order matters) — verify with
 // verifyHeader, NOT constructEvent (that one is for real webhook events).
+// Typed so route handlers can map it to 401; anything else thrown after a
+// valid signature is a server-side failure → 500 (a catch-all 401 made the
+// reviewer's disconnect failure look like an auth problem, 2026-09-09).
+class SignatureError extends Error {}
+
 function verifyAppSignature(req: express.Request): { accountId: string; userId: string } {
   const sig = (req.headers['stripe-signature'] as string) || '';
-  if (!sig) throw new Error('Missing Stripe-Signature header');
+  if (!sig) throw new SignatureError('Missing Stripe-Signature header');
   const body = (req.body ?? {}) as { user_id?: string; account_id?: string };
   if (!body.user_id || !body.account_id) {
-    throw new Error('Missing user_id/account_id in signed request');
+    throw new SignatureError('Missing user_id/account_id in signed request');
   }
   const payload = JSON.stringify({ user_id: body.user_id, account_id: body.account_id });
   try {
-    if (!stripe.webhooks.signature) throw new Error('verifyHeader unavailable');
+    if (!stripe.webhooks.signature) throw new SignatureError('verifyHeader unavailable');
     stripe.webhooks.signature.verifyHeader(payload, sig, STRIPE_APP_SECRET);
   } catch (e) {
-    throw new Error(`Signature verification failed: ${(e as Error).message}`);
+    if (e instanceof SignatureError) throw e;
+    throw new SignatureError(`Signature verification failed: ${(e as Error).message}`);
   }
   return { accountId: body.account_id, userId: body.user_id };
 }
@@ -400,7 +406,7 @@ app.post('/api/status', async (req, res) => {
       webhookEnabled: webhookOk,
     });
   } catch (e) {
-    res.status(401).json({ error: (e as Error).message });
+    res.status(e instanceof SignatureError ? 401 : 500).json({ error: (e as Error).message });
   }
 });
 
@@ -434,7 +440,7 @@ app.post('/api/connect', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error(`[connect] failed: ${(e as Error).message}`);
-    res.status(401).json({ error: (e as Error).message });
+    res.status(e instanceof SignatureError ? 401 : 500).json({ error: (e as Error).message });
   }
 });
 
@@ -450,8 +456,10 @@ app.post('/api/disconnect', async (req, res) => {
     }
     res.json({ ok: true });
   } catch (e) {
-    // Signature already verified above — a failure here is a backend error, not 401.
-    res.status(500).json({ error: (e as Error).message });
+    // Signature errors → 401; anything after a valid signature is a backend
+    // failure → 500 (a blanket 401 made the reviewer's disconnect look like an
+    // auth problem, 2026-09-09).
+    res.status(e instanceof SignatureError ? 401 : 500).json({ error: (e as Error).message });
   }
 });
 
