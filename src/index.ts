@@ -117,6 +117,54 @@ async function findSecret(name: string, accountId?: string, apiKey?: string): Pr
   return data.payload ?? null;
 }
 
+// Remove a Secret Store entry. Writing an empty payload is REJECTED by Stripe
+// (`400 parameter_invalid_empty: "You passed an empty string for 'payload'"`) —
+// caught by a marketplace reviewer on /api/disconnect (2026-09-09). The correct
+// clearing call is POST /v1/apps/secrets/delete (name + account scope).
+async function deleteSecret(name: string, accountId?: string): Promise<void> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+  };
+  if (accountId) headers['Stripe-Account'] = accountId;
+  const form = new URLSearchParams();
+  form.set('name', name);
+  form.set('scope[type]', 'account');
+  const res = await fetch('https://api.stripe.com/v1/apps/secrets/delete', {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form,
+  });
+  // 404 = already absent — treat as success so disconnect is idempotent.
+  if (res.status === 404) return;
+  if (!res.ok) throw new Error(`Secret Store delete failed: ${res.status} ${await res.text()}`);
+}
+
+// Real webhook health check for /api/status. The drawer used to claim
+// "Checkout webhook: enabled" unconditionally (hardcoded true) — a marketplace
+// reviewer proved that misleading when Stripe never delivered events because the
+// dashboard endpoint was registered WITHOUT "Listen to events on connected
+// accounts" (2026-09-09). Query the developer account's endpoints instead.
+async function webhookEndpointHealthy(): Promise<boolean> {
+  try {
+    const res = await fetch('https://api.stripe.com/v1/webhook_endpoints?limit=100', {
+      headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}` },
+    });
+    if (!res.ok) return false;
+    const data = (await res.json()) as {
+      data?: { url?: string; status?: string; enabled_events?: string[] }[];
+    };
+    return (data.data ?? []).some(
+      (e) =>
+        e.url === `${APP_URL}/hooks/app` &&
+        e.status === 'enabled' &&
+        (e.enabled_events ?? []).includes('checkout.session.completed'),
+    );
+  } catch {
+    return false;
+  }
+}
+
+
 // ── Signature verification for UI-extension → backend calls ───────────
 // App-embedded signatures (fetchStripeSignature) cover exactly the string
 // `{"user_id":...,"account_id":...}` (field order matters) — verify with
@@ -258,6 +306,7 @@ async function submitInvoiceToFiscalLink(
 function mapCheckoutToInvoice(
   session: Stripe.Checkout.Session,
   issuer: { name: string; vatNumber?: string },
+  apiLineItems?: { description?: string | null; quantity?: number | null; amount_total?: number | null }[],
 ): InvoicePayload {
   const currency = (session.currency || 'RON').toUpperCase();
   const amountTotal = session.amount_total ?? 0;
@@ -267,7 +316,10 @@ function mapCheckoutToInvoice(
   const subtotal = Math.round((amountTotal * 100) / (100 + vatRate)) / 100;
   const totalVAT = Math.round((amountTotal - subtotal * 100) / 100 * 100) / 100;
 
-  const lineItems = (session.line_items?.data ?? []).map((li) => ({
+  // Prefer items fetched via the line_items sub-endpoint (app-scoped tokens can't
+  // expand); fall back to the event payload's own line_items when present.
+  const rawItems = apiLineItems ?? session.line_items?.data ?? [];
+  const lineItems = rawItems.map((li) => ({
     name: li.description || 'Stripe checkout item',
     quantity: li.quantity ?? 1,
     unitPrice: (li.amount_total ?? 0) / 100 / (li.quantity ?? 1),
@@ -332,18 +384,20 @@ app.post('/api/status', async (req, res) => {
   try {
     const { accountId } = verifyAppSignature(req);
     console.log(`[status] account=${accountId}`);
-    const [fiscalLinkKey, cif] = await Promise.all([
+    const [fiscalLinkKey, cif, webhookOk] = await Promise.all([
       findSecret(SECRET_FISCALLINK_KEY, accountId),
       findSecret(SECRET_ANAF_CIF, accountId),
+      webhookEndpointHealthy(),
     ]);
-    console.log(`[status] key=${Boolean(fiscalLinkKey)} cif=${Boolean(cif)}`);
+    console.log(`[status] key=${Boolean(fiscalLinkKey)} cif=${Boolean(cif)} webhook=${webhookOk}`);
     res.json({
       installed: true,
       fiscalLinkConnected: Boolean(fiscalLinkKey),
       anafConfigured: Boolean(cif),
-      // The checkout webhook is a single developer-configured endpoint (monitors
-      // connected accounts) — always on once the app is installed.
-      webhookEnabled: true,
+      // Real check against the developer account's registered endpoints — was
+      // hardcoded true before, which misled the reviewer (2026-09-09) into
+      // believing events were flowing when no connected-account endpoint existed.
+      webhookEnabled: webhookOk,
     });
   } catch (e) {
     res.status(401).json({ error: (e as Error).message });
@@ -390,11 +444,14 @@ app.post('/api/disconnect', async (req, res) => {
     for (const name of [
       SECRET_FISCALLINK_KEY, SECRET_ANAF_CIF, SECRET_ANAF_CLIENT_ID, SECRET_ANAF_CLIENT_SECRET,
     ]) {
-      await setSecret(name, '', accountId); // empty payload effectively clears it
+      // Empty-payload writes are rejected by the Secret Store (parameter_invalid_empty);
+      // clearing must go through the delete endpoint (reviewer-caught 2026-09-09).
+      await deleteSecret(name, accountId);
     }
     res.json({ ok: true });
   } catch (e) {
-    res.status(401).json({ error: (e as Error).message });
+    // Signature already verified above — a failure here is a backend error, not 401.
+    res.status(500).json({ error: (e as Error).message });
   }
 });
 
@@ -420,16 +477,21 @@ app.post('/hooks/app', async (req, res) => {
         console.error(`checkout.session.completed for ${merchantAccountId}: FiscalLink API key not configured`);
         return res.json({ received: true, skipped: 'no-api-key' });
       }
-      // Fetch the session expanded (webhook events are not expanded).
+      // Fetch the session + line items. NOTE (field-verified 2026-09-09): app-scoped
+      // OAuth tokens (scope=stripe_apps) CANNOT expand reads — retrieve with
+      // expand[]=line_items 403s with more_permissions_required_for_application
+      // ("Having the 'read_only' scope would allow this request"). Plain retrieve
+      // and the line_items sub-endpoint are both allowed, so list items separately.
       const sm = await merchantStripe(merchantAccountId);
-      const full = await sm.checkout.sessions.retrieve(session.id, {
-        expand: ['line_items', 'customer'],
-      });
+      const [full, lineItemsRes] = await Promise.all([
+        sm.checkout.sessions.retrieve(session.id),
+        sm.checkout.sessions.listLineItems(session.id, { limit: 100 }),
+      ]);
       const issuer = {
         name: session.metadata?.merchant_name || 'Stripe merchant',
         vatNumber: cif || undefined,
       };
-      const invoice = mapCheckoutToInvoice(full, issuer);
+      const invoice = mapCheckoutToInvoice(full, issuer, lineItemsRes.data);
       const result = await submitInvoiceToFiscalLink(apiKey, invoice);
       if (!result.ok) {
         console.error(`FiscalLink submission failed (${result.status}) for ${session.id}:`,
@@ -441,7 +503,7 @@ app.post('/hooks/app', async (req, res) => {
         SECRET_FISCALLINK_KEY, SECRET_ANAF_CIF, SECRET_ANAF_CLIENT_ID, SECRET_ANAF_CLIENT_SECRET,
         SECRET_REFRESH_TOKEN, SECRET_ACCOUNT_ID,
       ]) {
-        await setSecret(name, '', merchantAccountId);
+        await deleteSecret(name, merchantAccountId);
       }
       console.log(`App deauthorized for ${merchantAccountId} — secrets cleared`);
     }
