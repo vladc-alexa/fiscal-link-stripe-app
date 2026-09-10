@@ -43,6 +43,11 @@ const STRIPE_SECRET_KEY_LIVE = process.env.STRIPE_SECRET_KEY_LIVE || '';
 // Signing secret of the dashboard-registered webhook endpoint (Developers → Webhooks →
 // "Listen to events on connected accounts"). Stripe signs app events with it.
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+// Alternate-mode webhook secret. Each event destination (live and test) has its OWN signing
+// secret while the deployment holds a single primary secret, so a test-mode delivery would
+// otherwise 400 the moment the primary secret flips to live. Set this to the secret of the
+// OTHER mode's /hooks/app destination. Field-verified 2026-09-10.
+const STRIPE_WEBHOOK_SECRET_TEST = process.env.STRIPE_WEBHOOK_SECRET_TEST || '';
 
 // ── Secret Store names (account-scoped) ──────────────────────────────
 const SECRET_REFRESH_TOKEN = 'fiscallink_stripe_refresh_token';
@@ -463,6 +468,30 @@ app.post('/api/disconnect', async (req, res) => {
   }
 });
 
+/**
+ * Verify a delivery to /hooks/app against every configured secret.
+ *
+ * Two event destinations feed this endpoint — a live one and a test one — each with its own
+ * signing secret, but the deployment holds one primary secret. Try the primary first, then
+ * the alternate-mode secret, so test-mode installs (Stripe's external-testing flow and the
+ * marketplace reviewer, who installs in test mode) keep working after the deployment's
+ * primary key flips to live. Only the last error is surfaced so a wrong secret still reads
+ * as a signature failure (401/400), not as a server error.
+ */
+function verifyAppEventSignature(raw: string, sig: string): Stripe.Event {
+  const candidates = [STRIPE_WEBHOOK_SECRET, STRIPE_WEBHOOK_SECRET_TEST].filter((s) => s.length > 0);
+  if (candidates.length === 0) throw new Error('STRIPE_WEBHOOK_SECRET not configured');
+  let lastError: Error = new Error('Signature verification failed');
+  for (const secret of candidates) {
+    try {
+      return stripe.webhooks.constructEvent(raw, sig, secret);
+    } catch (e) {
+      lastError = e as Error;
+    }
+  }
+  throw lastError;
+}
+
 // ── 3. App event receiver (connected accounts) ────────────────────────
 // One endpoint, registered in the DEVELOPER's Stripe dashboard with
 // "Listen to events on connected accounts". Events carry the merchant's account id
@@ -472,7 +501,7 @@ app.post('/hooks/app', async (req, res) => {
     if (!STRIPE_WEBHOOK_SECRET) throw new Error('STRIPE_WEBHOOK_SECRET not configured');
     const sig = (req.headers['stripe-signature'] as string) || '';
     const raw = ((req as express.Request & { rawBody?: Buffer }).rawBody || Buffer.from('')).toString('utf8');
-    const event = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET);
+    const event = verifyAppEventSignature(raw, sig);
 
     const merchantAccountId = (event as Stripe.Event & { account?: string }).account || '';
     if (!merchantAccountId) throw new Error('Event missing account (connected merchant)');
@@ -506,14 +535,30 @@ app.post('/hooks/app', async (req, res) => {
           JSON.stringify(result.body).slice(0, 300));
       }
     } else if (event.type === 'account.application.deauthorized') {
-      // App uninstalled — clear merchant secrets.
+      // App uninstalled — clear merchant secrets. The account is already deauthorized, so
+      // Stripe answers 403 `account_invalid` ("Application access may have been revoked")
+      // for its whole Secret Store: that is the expected terminal state, not a failure.
+      // Previously this threw, the handler answered 400, and Stripe retried the delivery
+      // (seen as a red "failed" event in the reviewer's dashboard, 2026-09-10).
+      const failures: string[] = [];
       for (const name of [
         SECRET_FISCALLINK_KEY, SECRET_ANAF_CIF, SECRET_ANAF_CLIENT_ID, SECRET_ANAF_CLIENT_SECRET,
         SECRET_REFRESH_TOKEN, SECRET_ACCOUNT_ID,
       ]) {
-        await deleteSecret(name, merchantAccountId);
+        try {
+          await deleteSecret(name, merchantAccountId);
+        } catch (e) {
+          const message = (e as Error).message;
+          if (/40[34]/.test(message)) continue; // already gone / no access left — done
+          failures.push(`${name}: ${message}`);
+        }
       }
-      console.log(`App deauthorized for ${merchantAccountId} — secrets cleared`);
+      if (failures.length > 0) {
+        // Still answer 2xx so Stripe does not retry forever; the account is gone either way.
+        console.error(`App deauthorized for ${merchantAccountId}: ${failures.join('; ')}`);
+      } else {
+        console.log(`App deauthorized for ${merchantAccountId} — secrets cleared`);
+      }
     }
     res.json({ received: true });
   } catch (e) {
