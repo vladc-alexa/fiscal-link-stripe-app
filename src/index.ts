@@ -57,7 +57,12 @@ const SECRET_ANAF_CIF = 'fiscallink_anaf_cif';
 const SECRET_ANAF_CLIENT_ID = 'fiscallink_anaf_client_id';
 const SECRET_ANAF_CLIENT_SECRET = 'fiscallink_anaf_client_secret';
 
+import { createEventDeduplicator } from './dedupe';
+
 const app = express();
+
+// Dedupe /hooks/app deliveries: retries and duplicate destinations must not raise a second invoice.
+const eventDedupe = createEventDeduplicator();
 app.use(cors());
 // Request logging: leaves a forensic trail (method, path, status, latency, IP, UA)
 // for support/review investigations — e.g. Stripe's app-review installs.
@@ -156,13 +161,18 @@ async function webhookEndpointHealthy(): Promise<boolean> {
     });
     if (!res.ok) return false;
     const data = (await res.json()) as {
-      data?: { url?: string; status?: string; enabled_events?: string[] }[];
+      data?: { url?: string; status?: string; enabled_events?: string[]; application?: string | null }[];
     };
     return (data.data ?? []).some(
       (e) =>
         e.url === `${APP_URL}/hooks/app` &&
         e.status === 'enabled' &&
-        (e.enabled_events ?? []).includes('checkout.session.completed'),
+        (e.enabled_events ?? []).includes('checkout.session.completed') &&
+        // App-bound destinations carry the app's client id; an account-scoped one created by
+        // hand looks identical in every other field but never receives connected-account
+        // events — the state that silently drops every merchant payment (2026-09-10).
+        typeof e.application === 'string' &&
+        e.application.startsWith('ca_'),
     );
   } catch {
     return false;
@@ -505,6 +515,11 @@ app.post('/hooks/app', async (req, res) => {
 
     const merchantAccountId = (event as Stripe.Event & { account?: string }).account || '';
     if (!merchantAccountId) throw new Error('Event missing account (connected merchant)');
+
+    if (eventDedupe.isDuplicate(event.id)) {
+      console.log(`Duplicate delivery of ${event.id} (${event.type}) for ${merchantAccountId} — already handled`);
+      return res.json({ received: true, duplicate: true });
+    }
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session;
