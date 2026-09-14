@@ -161,18 +161,36 @@ async function webhookEndpointHealthy(): Promise<boolean> {
     });
     if (!res.ok) return false;
     const data = (await res.json()) as {
-      data?: { url?: string; status?: string; enabled_events?: string[]; application?: string | null }[];
+      data?: { id?: string; url?: string; status?: string; enabled_events?: string[] }[];
     };
-    return (data.data ?? []).some(
+    const candidates = (data.data ?? []).filter(
       (e) =>
         e.url === `${APP_URL}/hooks/app` &&
         e.status === 'enabled' &&
-        (e.enabled_events ?? []).includes('checkout.session.completed') &&
-        // App-bound destinations carry the app's client id; an account-scoped one created by
-        // hand looks identical in every other field but never receives connected-account
-        // events — the state that silently drops every merchant payment (2026-09-10).
-        typeof e.application === 'string' &&
-        e.application.startsWith('ca_'),
+        (e.enabled_events ?? []).includes('checkout.session.completed'),
+    );
+    if (!candidates.length) return false;
+
+    // Scope ("Events from") is what decides whether merchant events ever arrive, and v1
+    // hides it: a destination registered as "Your account" looks identical (url, status,
+    // events) and, when created by hand in the dashboard, also reports application: null.
+    // v2 exposes the routing as events_from: 'other_accounts' = Connected accounts (what a
+    // marketplace app needs), 'self' = Your account (silently drops every merchant event —
+    // 2026-09-09/14). Scope can only be set at creation; it is not updatable afterwards.
+    const v2 = await fetch('https://api.stripe.com/v2/core/event_destinations?limit=100', {
+      headers: {
+        Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+        'Stripe-Version': '2025-12-15.clover',
+      },
+    });
+    if (!v2.ok) return false;
+    const destinations = (await v2.json()) as { data?: { id?: string; events_from?: string[] }[] };
+    const ids = new Set(candidates.map((c) => c.id));
+    return (destinations.data ?? []).some(
+      (d) =>
+        d.id !== undefined &&
+        ids.has(d.id) &&
+        (d.events_from ?? []).includes('other_accounts'),
     );
   } catch {
     return false;
