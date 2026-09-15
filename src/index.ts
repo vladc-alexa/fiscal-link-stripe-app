@@ -58,6 +58,8 @@ const SECRET_ANAF_CLIENT_ID = 'fiscallink_anaf_client_id';
 const SECRET_ANAF_CLIENT_SECRET = 'fiscallink_anaf_client_secret';
 
 import { createEventDeduplicator } from './dedupe';
+import { mapCheckoutToInvoice } from './invoice-map';
+import type { InvoicePayload } from './invoice-map';
 
 const app = express();
 
@@ -315,17 +317,6 @@ async function merchantStripe(accountId: string): Promise<Stripe> {
 }
 
 // ── FiscalLink core helpers ───────────────────────────────────────────
-interface InvoicePayload {
-  invoiceNumber: string;
-  issueDate: string;
-  dueDate: string;
-  currency: string;
-  issuer: { name: string; vatNumber?: string };
-  buyer: { name: string; vatNumber?: string; email?: string };
-  items: { name: string; quantity: number; unitPrice: number; vatRate: number }[];
-  totals: { subtotal: number; totalVAT: number; total: number };
-}
-
 async function submitInvoiceToFiscalLink(
   apiKey: string,
   payload: InvoicePayload,
@@ -340,62 +331,6 @@ async function submitInvoiceToFiscalLink(
   });
   const body = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, body };
-}
-
-function mapCheckoutToInvoice(
-  session: Stripe.Checkout.Session,
-  issuer: { name: string; vatNumber?: string },
-  apiLineItems?: { description?: string | null; quantity?: number | null; amount_total?: number | null }[],
-): InvoicePayload {
-  const currency = (session.currency || 'RON').toUpperCase();
-  const amountTotal = session.amount_total ?? 0;
-  // Romanian standard VAT rate for goods/services (19%) as the default split;
-  // merchants should keep line items priced ex-VAT for an exact split.
-  const vatRate = 19;
-  const subtotal = Math.round((amountTotal * 100) / (100 + vatRate)) / 100;
-  const totalVAT = Math.round((amountTotal - subtotal * 100) / 100 * 100) / 100;
-
-  // Prefer items fetched via the line_items sub-endpoint (app-scoped tokens can't
-  // expand); fall back to the event payload's own line_items when present.
-  const rawItems = apiLineItems ?? session.line_items?.data ?? [];
-  const lineItems = rawItems.map((li) => ({
-    name: li.description || 'Stripe checkout item',
-    quantity: li.quantity ?? 1,
-    unitPrice: (li.amount_total ?? 0) / 100 / (li.quantity ?? 1),
-    vatRate,
-  }));
-  if (lineItems.length === 0) {
-    lineItems.push({ name: 'Stripe checkout', quantity: 1, unitPrice: subtotal, vatRate });
-  }
-
-  const customer = session.customer_details;
-  const buyerName = customer?.name || customer?.email || 'Stripe customer';
-  const buyerEmail = customer?.email;
-  // B2B buyers can supply a VAT number; consumer (B2C) checkouts leave it blank —
-  // the core schema accepts it either way.
-
-  const ts = Math.floor(Date.now() / 1000);
-  const invoiceNumber = `INV-STRIPE-${ts}`;
-  const issueDate = new Date().toISOString().slice(0, 10);
-  const due = new Date(Date.now() + 15 * 86400_000).toISOString().slice(0, 10);
-
-  return {
-    invoiceNumber,
-    issueDate,
-    dueDate: due,
-    currency,
-    issuer,
-    buyer: {
-      name: buyerName,
-      ...(buyerEmail ? { email: buyerEmail } : {}),
-    },
-    items: lineItems,
-    totals: {
-      subtotal: Math.round(subtotal * 100) / 100,
-      totalVAT: Math.round(totalVAT * 100) / 100,
-      total: amountTotal / 100,
-    },
-  };
 }
 
 // ── 1. OAuth install flow ─────────────────────────────────────────────
