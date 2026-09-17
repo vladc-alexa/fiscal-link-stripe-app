@@ -93,7 +93,10 @@ generates the **App secret** used by `fetchStripeSignature` and backend verifica
 
 - [ ] Verify `Stripe-Account` header scoping of Secret Store calls during external test.
 - [ ] Decide whether `checkout.session.expired` should also trigger anything (currently no-op).
-- [ ] Buyer VAT capture: B2B customers can supply a VAT number via checkout custom fields;
-      mapping to `buyer.vatNumber` is a follow-up (currently blank for consumers).
+- [x] Buyer VAT capture: `extractBuyerVat()` reads the tax id Stripe collected for the checkout
+      (`customer_details.tax_ids`) and, failing that, a merchant-defined checkout custom field
+      labelled CIF/VAT/TVA/tax — validated with the official RO checksum, then mapped to
+      `buyer.vatNumber`. Consumer checkouts stay blank (valid e-Factura case). Covered by
+      `npm run check:mapping`; the live end-to-end check still needs a Stripe test-mode upload.
 - [ ] `app.installed` handler: optionally pre-provision the webhook endpoint (currently done
       on first "Enable" click).
