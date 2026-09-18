@@ -65,6 +65,14 @@ const app = express();
 
 // Dedupe /hooks/app deliveries: retries and duplicate destinations must not raise a second invoice.
 const eventDedupe = createEventDeduplicator();
+
+/**
+ * Last failed invoice submission, per merchant account. Exposed on /api/status so a
+ * rejection by core is visible in the app drawer instead of only in the logs.
+ * (A 400 from core is permanent — Stripe retries would not help — so it must not be
+ * lost the way the "Stripe merchant" 19%-VAT failure of 2026-09-18 nearly was.)
+ */
+const lastInvoiceError = new Map<string, { status: number; session: string; at: string; detail: string }>();
 app.use(cors());
 // Request logging: leaves a forensic trail (method, path, status, latency, IP, UA)
 // for support/review investigations — e.g. Stripe's app-review installs.
@@ -306,14 +314,46 @@ async function refreshAccessToken(refreshToken: string) {
   return res.json() as Promise<{ access_token: string; refresh_token: string }>;
 }
 
-// Merchant-scoped Stripe API client (via the account's OAuth access token).
-async function merchantStripe(accountId: string): Promise<Stripe> {
+/**
+ * Fresh OAuth access token for a merchant account. Returned raw rather than wrapped in
+ * an SDK client because the checkout handler also needs it for a plain REST read of
+ * /v1/account — an account-scoped token may not call /v1/accounts/{id}, only "me".
+ * Stripe rotates the refresh token on every exchange, so the new one must be stored.
+ */
+async function merchantAccessToken(accountId: string): Promise<string> {
   const refreshToken = await findSecret(SECRET_REFRESH_TOKEN, accountId);
   if (!refreshToken) throw new Error('Not installed: missing OAuth refresh token');
   const { access_token, refresh_token } = await refreshAccessToken(refreshToken);
-  // Rotate the refresh token (Stripe rotates on every exchange).
   await setSecret(SECRET_REFRESH_TOKEN, refresh_token, accountId);
-  return new Stripe(access_token);
+  return access_token;
+}
+
+/**
+ * Best-effort issuer name for the invoice. `session.metadata.merchant_name` is the
+ * merchant's own choice; otherwise read the connected account's business name with its
+ * own OAuth token. The literal fallback would land on a filed fiscal document, so a
+ * miss is logged loudly rather than passed off as a real name.
+ */
+async function merchantBusinessName(accessToken: string): Promise<string | undefined> {
+  try {
+    const res = await fetch('https://api.stripe.com/v1/account', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) {
+      console.warn(`[invoice] business name lookup failed (${res.status})`);
+      return undefined;
+    }
+    const account = (await res.json()) as {
+      business_profile?: { name?: string | null } | null;
+      company?: { name?: string | null } | null;
+    };
+    const name = account?.business_profile?.name ?? account?.company?.name;
+    const trimmed = typeof name === 'string' ? name.trim() : '';
+    return trimmed || undefined;
+  } catch (e) {
+    console.warn(`[invoice] business name lookup error: ${(e as Error).message}`);
+    return undefined;
+  }
 }
 
 // ── FiscalLink core helpers ───────────────────────────────────────────
@@ -372,6 +412,8 @@ app.post('/api/status', async (req, res) => {
       // hardcoded true before, which misled the reviewer (2026-09-09) into
       // believing events were flowing when no connected-account endpoint existed.
       webhookEnabled: webhookOk,
+      // Set when the last checkout on this account failed to become an invoice.
+      lastInvoiceError: lastInvoiceError.get(accountId) ?? null,
     });
   } catch (e) {
     res.status(e instanceof SignatureError ? 401 : 500).json({ error: (e as Error).message });
@@ -487,20 +529,40 @@ app.post('/hooks/app', async (req, res) => {
       // expand[]=line_items 403s with more_permissions_required_for_application
       // ("Having the 'read_only' scope would allow this request"). Plain retrieve
       // and the line_items sub-endpoint are both allowed, so list items separately.
-      const sm = await merchantStripe(merchantAccountId);
+      // One token acquisition for both the SDK client and the plain /v1/account read.
+      const accessToken = await merchantAccessToken(merchantAccountId);
+      const sm = new Stripe(accessToken);
       const [full, lineItemsRes] = await Promise.all([
         sm.checkout.sessions.retrieve(session.id),
         sm.checkout.sessions.listLineItems(session.id, { limit: 100 }),
       ]);
       const issuer = {
-        name: session.metadata?.merchant_name || 'Stripe merchant',
+        name:
+          session.metadata?.merchant_name || (await merchantBusinessName(accessToken)) || 'Stripe merchant',
         vatNumber: cif || undefined,
       };
       const invoice = mapCheckoutToInvoice(full, issuer, lineItemsRes.data);
       const result = await submitInvoiceToFiscalLink(apiKey, invoice);
       if (!result.ok) {
-        console.error(`FiscalLink submission failed (${result.status}) for ${session.id}:`,
-          JSON.stringify(result.body).slice(0, 300));
+        const detail = JSON.stringify(result.body).slice(0, 500);
+        console.error(`FiscalLink submission failed (${result.status}) for ${session.id}:`, detail);
+        lastInvoiceError.set(merchantAccountId, {
+          status: result.status,
+          session: session.id,
+          at: new Date().toISOString(),
+          detail,
+        });
+        if (result.status >= 500 || result.status === 429) {
+          // Transient upstream failure: clear the dedupe mark and answer non-2xx so
+          // Stripe retries this delivery. Acking 200 here loses the invoice silently.
+          eventDedupe.forget(event.id);
+          return res.status(502).json({ error: 'invoice submission failed upstream', status: result.status });
+        }
+        // Permanent rejection (schema/validation, e.g. a VAT rule): a retry cannot help.
+        // Ack to stop the retry storm, but leave it in /api/status and the logs.
+      } else {
+        lastInvoiceError.delete(merchantAccountId);
+        console.log(`Invoice created for ${merchantAccountId} from ${session.id}`);
       }
     } else if (event.type === 'account.application.deauthorized') {
       // App uninstalled — clear merchant secrets. The account is already deauthorized, so

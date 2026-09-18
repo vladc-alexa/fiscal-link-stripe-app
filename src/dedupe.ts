@@ -33,5 +33,14 @@ export function createEventDeduplicator(ttlMs = 24 * 60 * 60 * 1000, maxEntries 
     size(): number {
       return seen.size;
     },
+    /**
+     * Drop the id so a later delivery of the same event is processed again.
+     * Used when the handling failed in a way Stripe can retry: marking it seen
+     * on the failed attempt would make the retry answer `duplicate` and the
+     * invoice would never be created.
+     */
+    forget(id: string): void {
+      seen.delete(id);
+    },
   };
 }

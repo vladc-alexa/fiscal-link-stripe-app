@@ -40,4 +40,38 @@ const other = { ...base, custom_fields: [{ key: 'note', label: 'Gift note', text
 assert.equal(extractBuyerVat(other), undefined);
 assert.equal(mapCheckoutToInvoice(other, { name: 'X' }).items.length, 1, 'fallback line item');
 
-console.log('invoice-map checks: 13 assertions passed');
+// ── VAT comes from the payment, never from a constant (live failure 2026-09-18) ──
+// A hardcoded 19% + "gross includes VAT" produced a VAT line on every invoice, which
+// core rejects for a supplier that is not registered for VAT ("must be 0 when
+// issuer.vatRegistered is false"). The rate must follow what the merchant charged.
+const noTax = {
+  ...base,
+  amount_subtotal: 11900,
+  amount_total: 11900,
+  total_details: { amount_tax: 0 },
+} as any;
+const noTaxInvoice = mapCheckoutToInvoice(noTax, { name: 'FiscalLink' });
+assert.equal(noTaxInvoice.items[0].vatRate, 0, 'no tax charged → 0% (valid for a non-VAT issuer)');
+assert.equal(noTaxInvoice.totals.totalVAT, 0, 'no VAT line');
+assert.equal(noTaxInvoice.totals.total, 119, 'total unchanged');
+assert.equal(noTaxInvoice.totals.subtotal, 119, 'subtotal = total when there is no tax');
+
+const withVat = {
+  ...base,
+  amount_subtotal: 10000,
+  amount_total: 12100,
+  total_details: { amount_tax: 2100 },
+} as any;
+const withVatInvoice = mapCheckoutToInvoice(withVat, { name: 'VAT SRL', vatNumber: 'RO32736839' });
+assert.equal(withVatInvoice.items[0].vatRate, 21, 'rate derived from the tax actually charged');
+assert.equal(withVatInvoice.totals.subtotal, 100, 'net subtotal');
+assert.equal(withVatInvoice.totals.totalVAT, 21, 'VAT extracted from the gross');
+assert.equal(withVatInvoice.totals.total, 121, 'gross preserved');
+
+// Line items are filed net of VAT, so their sum matches the net subtotal.
+const netItems = mapCheckoutToInvoice(withVat, { name: 'X' }, [
+  { description: 'Widget', quantity: 2, amount_subtotal: 10000, amount_total: 12100 },
+] as any);
+assert.equal(netItems.items[0].unitPrice, 50, 'unit price excludes VAT');
+
+console.log('invoice-map checks: 20 assertions passed');
