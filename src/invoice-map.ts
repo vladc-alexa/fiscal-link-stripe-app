@@ -212,7 +212,11 @@ export function mapCheckoutToInvoice(
   }
 
   const customer = session.customer_details;
-  const buyerName = customer?.name || customer?.email || 'Stripe customer';
+  // BT-44 wants the buyer's legal name. For a company checkout that is the business name
+  // (Stripe asks for it when the payment link collects business names); the cardholder name is
+  // the individual behind the card and is only the fallback.
+  const businessName = (customer as { business_name?: string | null } | null)?.business_name;
+  const buyerName = businessName?.trim() || customer?.name || customer?.email || 'Stripe customer';
   const buyerEmail = customer?.email;
   const buyerVat = extractBuyerVat(session);
   // The billing address (or the shipping address as a fallback) is what ANAF validates
