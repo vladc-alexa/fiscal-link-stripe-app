@@ -1,12 +1,28 @@
 import type Stripe from 'stripe';
 
+/**
+ * Postal address of a party. ANAF rejects a whole e-invoice when the seller's or buyer's
+ * street/city is missing (BR-08, BR-10, BR-RO-080, BR-RO-090), and CIUS-RO BR-RO-110 makes
+ * the county mandatory for a Romanian party — see `countrySubentity` (BT-39 seller / BT-54
+ * buyer). Core renders these into the UBL PostalAddress block.
+ */
+export interface PartyAddress {
+  street?: string;
+  city?: string;
+  postalCode?: string;
+  /** ISO 3166-1 alpha-2, e.g. `RO`. */
+  country?: string;
+  /** County name or ISO 3166-2 code, e.g. `Neamț` / `RO-NT`. */
+  countrySubentity?: string;
+}
+
 export interface InvoicePayload {
   invoiceNumber: string;
   issueDate: string;
   dueDate: string;
   currency: string;
-  issuer: { name: string; vatNumber?: string };
-  buyer: { name: string; vatNumber?: string; email?: string };
+  issuer: { name: string; vatNumber?: string; address?: PartyAddress };
+  buyer: { name: string; vatNumber?: string; email?: string; address?: PartyAddress };
   items: {
     name: string;
     quantity: number;
@@ -74,9 +90,39 @@ export function extractBuyerVat(session: Stripe.Checkout.Session): string | unde
   return undefined;
 }
 
+export function mapStripeAddress(
+  address?: {
+    line1?: string | null;
+    line2?: string | null;
+    city?: string | null;
+    postal_code?: string | null;
+    state?: string | null;
+    country?: string | null;
+  } | null,
+): PartyAddress | undefined {
+  const street = [address?.line1, address?.line2]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join(', ')
+    .trim();
+  const city = (address?.city ?? '').trim();
+  // Both are mandatory: a partial address is exactly what ANAF rejected on 2026-09-18.
+  if (!street || !city) return undefined;
+
+  const state = (address?.state ?? '').trim();
+  const country = (address?.country ?? '').trim().toUpperCase();
+  const postalCode = (address?.postal_code ?? '').trim();
+  return {
+    street,
+    city,
+    ...(postalCode ? { postalCode } : {}),
+    ...(country ? { country } : {}),
+    ...(state ? { countrySubentity: state } : {}),
+  };
+}
+
 export function mapCheckoutToInvoice(
   session: Stripe.Checkout.Session,
-  issuer: { name: string; vatNumber?: string },
+  issuer: { name: string; vatNumber?: string; address?: PartyAddress },
   apiLineItems?: {
     description?: string | null;
     quantity?: number | null;
@@ -131,6 +177,9 @@ export function mapCheckoutToInvoice(
   const buyerName = customer?.name || customer?.email || 'Stripe customer';
   const buyerEmail = customer?.email;
   const buyerVat = extractBuyerVat(session);
+  // The billing address is what ANAF validates (BT-50/BT-52); Checkout collects it when the
+  // merchant enables address collection.
+  const buyerAddress = mapStripeAddress(customer?.address);
 
   const ts = Math.floor(Date.now() / 1000);
   const issueDate = new Date().toISOString().slice(0, 10);
@@ -146,6 +195,7 @@ export function mapCheckoutToInvoice(
       name: buyerName,
       ...(buyerEmail ? { email: buyerEmail } : {}),
       ...(buyerVat ? { vatNumber: buyerVat } : {}),
+      ...(buyerAddress ? { address: buyerAddress } : {}),
     },
     items: lineItems,
     totals: {

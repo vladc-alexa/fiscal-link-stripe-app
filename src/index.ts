@@ -59,7 +59,7 @@ const SECRET_ANAF_CLIENT_SECRET = 'fiscallink_anaf_client_secret';
 
 import { createEventDeduplicator } from './dedupe';
 import { mapCheckoutToInvoice } from './invoice-map';
-import type { InvoicePayload } from './invoice-map';
+import type { InvoicePayload, PartyAddress } from './invoice-map';
 
 const app = express();
 
@@ -373,6 +373,37 @@ async function submitInvoiceToFiscalLink(
   return { ok: res.ok, status: res.status, body };
 }
 
+/**
+ * Issuer identity of the merchant's tenant, read from core ({@code GET /v1/issuer}).
+ *
+ * The legal name and postal address belong to the merchant's own company record in
+ * FiscalLink — not to Stripe — and ANAF refuses a document without the seller address
+ * (BR-08, BR-RO-080, BR-RO-090) and, for a Romanian party, the county (BR-RO-110).
+ * Reading it per event keeps it correct after the merchant edits their company data;
+ * it is one cheap call on a path that already calls core.
+ */
+interface IssuerProfile {
+  name?: string | null;
+  vatRegistered?: boolean | null;
+  address?: PartyAddress | null;
+}
+
+async function fetchIssuerProfile(apiKey: string): Promise<IssuerProfile | null> {
+  try {
+    const res = await fetch(`${CORE_URL}/v1/issuer`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!res.ok) {
+      console.warn(`[issuer] profile lookup failed (${res.status})`);
+      return null;
+    }
+    return (await res.json()) as IssuerProfile;
+  } catch (e) {
+    console.warn(`[issuer] profile lookup error: ${(e as Error).message}`);
+    return null;
+  }
+}
+
 // ── 1. OAuth install flow ─────────────────────────────────────────────
 app.get('/oauth/callback', async (req, res) => {
   try {
@@ -536,10 +567,31 @@ app.post('/hooks/app', async (req, res) => {
         sm.checkout.sessions.retrieve(session.id),
         sm.checkout.sessions.listLineItems(session.id, { limit: 100 }),
       ]);
+      // The issuer's legal identity lives in the merchant's FiscalLink company record, not in
+      // Stripe: ANAF rejects the whole document without the seller's postal address
+      // (BR-08/BR-RO-080/BR-RO-090) and county (BR-RO-110). Refuse to file an invalid
+      // document rather than put a rejection on the merchant's SPV record.
+      const profile = await fetchIssuerProfile(apiKey);
+      if (!profile?.address) {
+        const detail =
+          'issuer postal address missing: set the company address in FiscalLink — ANAF rejects an e-Factura without the seller address (BR-08, BR-RO-080, BR-RO-090)';
+        console.error(`Not filing invoice for ${session.id}: ${detail}`);
+        lastInvoiceError.set(merchantAccountId, {
+          status: 0,
+          session: session.id,
+          at: new Date().toISOString(),
+          detail,
+        });
+        return res.json({ received: true, skipped: 'issuer-address-missing' });
+      }
       const issuer = {
         name:
-          session.metadata?.merchant_name || (await merchantBusinessName(accessToken)) || 'Stripe merchant',
+          profile.name ||
+          session.metadata?.merchant_name ||
+          (await merchantBusinessName(accessToken)) ||
+          'Stripe merchant',
         vatNumber: cif || undefined,
+        address: profile.address,
       };
       const invoice = mapCheckoutToInvoice(full, issuer, lineItemsRes.data);
       const result = await submitInvoiceToFiscalLink(apiKey, invoice);

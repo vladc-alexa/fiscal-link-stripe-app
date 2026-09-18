@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { mapCheckoutToInvoice, extractBuyerVat, validCif, normalizeCif } from '../src/invoice-map';
+import { mapCheckoutToInvoice, extractBuyerVat, validCif, normalizeCif, mapStripeAddress } from '../src/invoice-map';
 
 // ── checksum ──
 assert.equal(validCif('RO32736839'), true, 'valid RO CIF accepted');
@@ -82,4 +82,45 @@ assert.equal(withVatInvoice.items[0].totalAmount, 121, 'line total includes VAT'
 assert.equal(withVatInvoice.items[0].vatAmount, 21, 'line VAT set');
 assert.equal(netItems.items[0].vatAmount, 21, 'line VAT follows the derived rate');
 
-console.log('invoice-map checks: 25 assertions passed');
+// ── addresses: ANAF rejects the document without street + city for both parties ──
+// Live rejection 2026-09-18: BR-08 / BR-10 / BR-RO-080 / BR-RO-090 on both parties.
+const ISSUER_ADDRESS = {
+  street: 'Str. Părăul Stroii 40A',
+  city: 'Pângărați',
+  postalCode: '617307',
+  country: 'RO',
+  countrySubentity: 'Neamț',
+};
+assert.equal(mapStripeAddress(null), undefined, 'no collected address → no half-filled block');
+assert.equal(mapStripeAddress({ line1: 'Str. X 1', city: null }), undefined, 'street without city is not filable');
+assert.deepEqual(
+  mapStripeAddress({
+    line1: 'Calea Victoriei 1',
+    line2: 'Ap. 4',
+    city: 'București',
+    postal_code: '010001',
+    state: 'București',
+    country: 'ro',
+  }),
+  {
+    street: 'Calea Victoriei 1, Ap. 4',
+    city: 'București',
+    postalCode: '010001',
+    country: 'RO',
+    countrySubentity: 'București',
+  },
+  'street/postal/county mapped for the UBL PostalAddress block',
+);
+
+const withAddress = {
+  ...base,
+  customer_details: {
+    ...base.customer_details,
+    address: { line1: 'Calea Victoriei 1', city: 'București', postal_code: '010001', state: 'București', country: 'RO' },
+  },
+} as any;
+const addressed = mapCheckoutToInvoice(withAddress, { name: 'Fiscal Link SRL', address: ISSUER_ADDRESS });
+assert.deepEqual(addressed.issuer.address, ISSUER_ADDRESS, 'issuer address flows into the payload');
+assert.equal(addressed.buyer.address?.street, 'Calea Victoriei 1', 'buyer billing address mapped');
+
+console.log('invoice-map checks: 32 assertions passed');
