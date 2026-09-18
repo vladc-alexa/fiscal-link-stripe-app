@@ -157,4 +157,21 @@ assert.equal(extractBuyerAddress(shippingOnly)?.city, 'Cluj-Napoca', 'shipping a
 assert.equal(mapCheckoutToInvoice(shippingOnly, { name: 'X' }).buyer.address?.street, 'Str. Fabricii 9');
 assert.equal(buyerAddressGap(shippingOnly), null, 'shipping-only checkout is filable');
 
-console.log('invoice-map checks: 41 assertions passed');
+// ── BT-44: a company checkout names the company, not the cardholder ──
+const companyCheckout = {
+  ...withAddress,
+  customer_details: { ...base.customer_details, name: 'Ion Popescu', business_name: 'Client SRL' },
+} as any;
+assert.equal(mapCheckoutToInvoice(companyCheckout, { name: 'X' }).buyer.name, 'Client SRL', 'business name wins for BT-44');
+const blankBusiness = {
+  ...withAddress,
+  customer_details: { ...base.customer_details, name: 'Ion Popescu', business_name: '  ' },
+} as any;
+assert.equal(mapCheckoutToInvoice(blankBusiness, { name: 'X' }).buyer.name, 'Ion Popescu', 'blank business name falls back to the cardholder');
+const consumerCheckout = {
+  ...withAddress,
+  customer_details: { ...base.customer_details, name: 'Ion Popescu', business_name: null },
+} as any;
+assert.equal(mapCheckoutToInvoice(consumerCheckout, { name: 'X' }).buyer.name, 'Ion Popescu', 'consumer keeps the cardholder name');
+
+console.log('invoice-map checks: 44 assertions passed');
