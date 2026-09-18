@@ -70,23 +70,39 @@ export function extractBuyerVat(session: Stripe.Checkout.Session): string | unde
 export function mapCheckoutToInvoice(
   session: Stripe.Checkout.Session,
   issuer: { name: string; vatNumber?: string },
-  apiLineItems?: { description?: string | null; quantity?: number | null; amount_total?: number | null }[],
+  apiLineItems?: {
+    description?: string | null;
+    quantity?: number | null;
+    amount_subtotal?: number | null;
+    amount_total?: number | null;
+  }[],
 ): InvoicePayload {
   const currency = (session.currency || 'RON').toUpperCase();
-  const amountTotal = session.amount_total ?? 0;
-  const vatRate = 19;
-  const subtotal = Math.round((amountTotal * 100) / (100 + vatRate)) / 100;
-  const totalVAT = Math.round((amountTotal - subtotal * 100) / 100 * 100) / 100;
+  const totalCents = session.amount_total ?? 0;
+  const taxCents = Math.max(0, session.total_details?.amount_tax ?? 0);
+  const netCents = Math.max(0, totalCents - taxCents);
+
+  // VAT comes from what the merchant actually charged — never from a constant.
+  // No tax charged => 0%: a supplier that is not registered for VAT may not
+  // mention VAT, and core rejects such a document outright.
+  // (Live failure 2026-09-18: a hardcoded 19% made every invoice invalid.)
+  const vatRate = taxCents > 0 && netCents > 0 ? Math.round((taxCents / netCents) * 100) : 0;
 
   const rawItems = apiLineItems ?? session.line_items?.data ?? [];
-  const lineItems = rawItems.map((li) => ({
-    name: li.description || 'Stripe checkout item',
-    quantity: li.quantity ?? 1,
-    unitPrice: (li.amount_total ?? 0) / 100 / (li.quantity ?? 1),
-    vatRate,
-  }));
+  const lineItems = rawItems.map((li) => {
+    const quantity = li.quantity ?? 1;
+    // Prefer the net amount; Stripe's amount_total includes tax when the merchant
+    // adds it on top, and the invoice carries the VAT as a separate line.
+    const net = li.amount_subtotal ?? li.amount_total ?? 0;
+    return {
+      name: li.description || 'Stripe checkout item',
+      quantity,
+      unitPrice: net / 100 / quantity,
+      vatRate,
+    };
+  });
   if (lineItems.length === 0) {
-    lineItems.push({ name: 'Stripe checkout', quantity: 1, unitPrice: subtotal, vatRate });
+    lineItems.push({ name: 'Stripe checkout', quantity: 1, unitPrice: netCents / 100, vatRate });
   }
 
   const customer = session.customer_details;
@@ -111,9 +127,9 @@ export function mapCheckoutToInvoice(
     },
     items: lineItems,
     totals: {
-      subtotal: Math.round(subtotal * 100) / 100,
-      totalVAT: Math.round(totalVAT * 100) / 100,
-      total: amountTotal / 100,
+      subtotal: Math.round(netCents) / 100,
+      totalVAT: Math.round(taxCents) / 100,
+      total: Math.round(totalCents) / 100,
     },
   };
 }
