@@ -74,4 +74,12 @@ const netItems = mapCheckoutToInvoice(withVat, { name: 'X' }, [
 ] as any);
 assert.equal(netItems.items[0].unitPrice, 50, 'unit price excludes VAT');
 
-console.log('invoice-map checks: 20 assertions passed');
+// Line totals must be present: core's PDF prints items[].totalAmount verbatim and
+// rendered "Total: null" on the real 2 RON invoice of 2026-09-18.
+assert.equal(noTaxInvoice.items[0].totalAmount, 119, 'line total present');
+assert.equal(noTaxInvoice.items[0].vatAmount, 0, 'line VAT present');
+assert.equal(withVatInvoice.items[0].totalAmount, 121, 'line total includes VAT');
+assert.equal(withVatInvoice.items[0].vatAmount, 21, 'line VAT set');
+assert.equal(netItems.items[0].vatAmount, 21, 'line VAT follows the derived rate');
+
+console.log('invoice-map checks: 25 assertions passed');

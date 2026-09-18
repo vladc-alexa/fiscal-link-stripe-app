@@ -7,7 +7,14 @@ export interface InvoicePayload {
   currency: string;
   issuer: { name: string; vatNumber?: string };
   buyer: { name: string; vatNumber?: string; email?: string };
-  items: { name: string; quantity: number; unitPrice: number; vatRate: number }[];
+  items: {
+    name: string;
+    quantity: number;
+    unitPrice: number;
+    vatRate: number;
+    vatAmount: number;
+    totalAmount: number;
+  }[];
   totals: { subtotal: number; totalVAT: number; total: number };
 }
 
@@ -88,21 +95,36 @@ export function mapCheckoutToInvoice(
   // (Live failure 2026-09-18: a hardcoded 19% made every invoice invalid.)
   const vatRate = taxCents > 0 && netCents > 0 ? Math.round((taxCents / netCents) * 100) : 0;
 
+  // Core's LineItem carries vatAmount/totalAmount as optional fields, but the PDF
+  // prints items[].totalAmount verbatim: leaving them out rendered "Total: null" on
+  // the real 2 RON invoice of 2026-09-18. Always send both, derived from the line.
+  const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+  const withTotals = (item: {
+    name: string;
+    quantity: number;
+    unitPrice: number;
+    vatRate: number;
+  }) => {
+    const lineNet = round2(item.unitPrice * item.quantity);
+    const vatAmount = round2((lineNet * item.vatRate) / 100);
+    return { ...item, vatAmount, totalAmount: round2(lineNet + vatAmount) };
+  };
+
   const rawItems = apiLineItems ?? session.line_items?.data ?? [];
   const lineItems = rawItems.map((li) => {
     const quantity = li.quantity ?? 1;
     // Prefer the net amount; Stripe's amount_total includes tax when the merchant
     // adds it on top, and the invoice carries the VAT as a separate line.
     const net = li.amount_subtotal ?? li.amount_total ?? 0;
-    return {
+    return withTotals({
       name: li.description || 'Stripe checkout item',
       quantity,
       unitPrice: net / 100 / quantity,
       vatRate,
-    };
+    });
   });
   if (lineItems.length === 0) {
-    lineItems.push({ name: 'Stripe checkout', quantity: 1, unitPrice: netCents / 100, vatRate });
+    lineItems.push(withTotals({ name: 'Stripe checkout', quantity: 1, unitPrice: netCents / 100, vatRate }));
   }
 
   const customer = session.customer_details;
