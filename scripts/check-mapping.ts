@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { mapCheckoutToInvoice, extractBuyerVat, validCif, normalizeCif, mapStripeAddress } from '../src/invoice-map';
+import { mapCheckoutToInvoice, extractBuyerVat, validCif, normalizeCif, mapStripeAddress, extractBuyerAddress, buyerAddressGap } from '../src/invoice-map';
 
 // ── checksum ──
 assert.equal(validCif('RO32736839'), true, 'valid RO CIF accepted');
@@ -123,4 +123,38 @@ const addressed = mapCheckoutToInvoice(withAddress, { name: 'Fiscal Link SRL', a
 assert.deepEqual(addressed.issuer.address, ISSUER_ADDRESS, 'issuer address flows into the payload');
 assert.equal(addressed.buyer.address?.street, 'Calea Victoriei 1', 'buyer billing address mapped');
 
-console.log('invoice-map checks: 32 assertions passed');
+// ── buyer address: collected where Stripe offers it, refused where it does not ──
+// Live rejection 2026-09-18 09:35 UTC (2 RON payment on a payment link with address
+// collection off): customer_details.address carried country=RO only, so the payload went
+// out with no buyer address and ANAF answered ERORI FACTURA with BR-10, BR-RO-080,
+// BR-RO-090 — a rejection on the merchant's SPV record for data the app cannot invent.
+const countryOnly = {
+  ...base,
+  customer_details: { ...base.customer_details, address: { country: 'RO', line1: null, city: null, postal_code: null, state: null } },
+} as any;
+assert.equal(extractBuyerAddress(countryOnly), undefined, 'country-only address is not filable');
+assert.equal(mapCheckoutToInvoice(countryOnly, { name: 'X' }).buyer.address, undefined, 'no half-filled buyer block');
+assert.ok(
+  buyerAddressGap(countryOnly)?.includes('Collect billing address'),
+  'the gap names the Stripe setting to turn on',
+);
+assert.ok(buyerAddressGap(countryOnly)?.includes('CIF'), 'a CIF-less consumer checkout is told about the CIF too');
+assert.equal(buyerAddressGap(withAddress), null, 'a complete buyer address clears the gap');
+assert.equal(
+  buyerAddressGap(withTaxId)?.includes('tax_id_collection'),
+  false,
+  'a merchant that already supplies the CIF is not nagged about it',
+);
+
+// Shipping address is the fallback: merchants that collect shipping but not billing still
+// give ANAF BT-50/BT-52.
+const shippingOnly = {
+  ...base,
+  customer_details: { ...base.customer_details, address: { country: 'RO' } },
+  shipping_details: { address: { line1: 'Str. Fabricii 9', city: 'Cluj-Napoca', postal_code: '400001', country: 'RO' } },
+} as any;
+assert.equal(extractBuyerAddress(shippingOnly)?.city, 'Cluj-Napoca', 'shipping address used when billing is empty');
+assert.equal(mapCheckoutToInvoice(shippingOnly, { name: 'X' }).buyer.address?.street, 'Str. Fabricii 9');
+assert.equal(buyerAddressGap(shippingOnly), null, 'shipping-only checkout is filable');
+
+console.log('invoice-map checks: 41 assertions passed');

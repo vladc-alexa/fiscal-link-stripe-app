@@ -226,6 +226,18 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
         New invoices appear in your FiscalLink dashboard; ANAF submission and answer polling
         run there. Quota and metering follow your FiscalLink plan.
       </Box>
+
+      <Box css={{ marginTop: 'medium', fontWeight: 'bold' }}>For an invoice ANAF accepts</Box>
+      <Box css={{ marginTop: 'xsmall' }}>
+        • Collect the buyer's billing address: Payment Links → Options → “Collect billing
+        address” = Required (or Checkout <code>billing_address_collection=required</code>).
+        Without street and city ANAF rejects the document (BR-10, BR-RO-080, BR-RO-090), so
+        FiscalLink skips it and reports it here rather than filing an invalid invoice.
+      </Box>
+      <Box css={{ marginTop: 'xsmall' }}>
+        • For a company buyer, also collect their CIF: turn on tax ID collection or add a
+        checkout custom field labelled CIF.
+      </Box>
     </Box>
   );
 };

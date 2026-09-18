@@ -120,6 +120,44 @@ export function mapStripeAddress(
   };
 }
 
+/**
+ * The buyer address ANAF validates, in order of trust: the billing address Stripe collected
+ * for the checkout, then the shipping address (a merchant that collects shipping but not
+ * billing still supplies what BT-50/BT-52 need). Both street and city are required — a
+ * country-only address (all Checkout collects when billing address collection is off) is
+ * not filable, which is what ANAF rejected on 2026-09-18.
+ */
+export function extractBuyerAddress(session: Stripe.Checkout.Session): PartyAddress | undefined {
+  const s = session as unknown as {
+    customer_details?: { address?: Parameters<typeof mapStripeAddress>[0] } | null;
+    shipping_details?: { address?: Parameters<typeof mapStripeAddress>[0] } | null;
+  };
+  return (
+    mapStripeAddress(s.customer_details?.address) ?? mapStripeAddress(s.shipping_details?.address)
+  );
+}
+
+/**
+ * Why ANAF would refuse this checkout's invoice for want of buyer data, or null when the
+ * buyer block is complete. The app cannot invent an address, so the caller must not file
+ * and must tell the merchant which Stripe setting to turn on instead.
+ * Live rejection 2026-09-18 (2 RON payment, payment link without address collection):
+ * [BR-10], [BR-RO-080], [BR-RO-090] and "nu a fost identificat cui cumparator".
+ */
+export function buyerAddressGap(session: Stripe.Checkout.Session): string | null {
+  if (extractBuyerAddress(session)) return null;
+  const vat = extractBuyerVat(session);
+  return (
+    'buyer address missing: ANAF rejects an e-Factura without the buyer street and city ' +
+    '(BR-10, BR-RO-080, BR-RO-090), so this payment was not filed. In Stripe enable address ' +
+    'collection for the checkout: Payment Links → Options → "Collect billing address" = Required ' +
+    '(or Checkout billing_address_collection=required)' +
+    (vat
+      ? '.'
+      : ', and if the buyer is a company also collect their CIF (tax_id_collection, or a CIF custom field).')
+  );
+}
+
 export function mapCheckoutToInvoice(
   session: Stripe.Checkout.Session,
   issuer: { name: string; vatNumber?: string; address?: PartyAddress },
@@ -177,9 +215,9 @@ export function mapCheckoutToInvoice(
   const buyerName = customer?.name || customer?.email || 'Stripe customer';
   const buyerEmail = customer?.email;
   const buyerVat = extractBuyerVat(session);
-  // The billing address is what ANAF validates (BT-50/BT-52); Checkout collects it when the
-  // merchant enables address collection.
-  const buyerAddress = mapStripeAddress(customer?.address);
+  // The billing address (or the shipping address as a fallback) is what ANAF validates
+  // (BT-50/BT-52); Checkout only collects it when the merchant enables address collection.
+  const buyerAddress = extractBuyerAddress(session);
 
   const ts = Math.floor(Date.now() / 1000);
   const issueDate = new Date().toISOString().slice(0, 10);
