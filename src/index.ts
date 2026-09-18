@@ -58,7 +58,7 @@ const SECRET_ANAF_CLIENT_ID = 'fiscallink_anaf_client_id';
 const SECRET_ANAF_CLIENT_SECRET = 'fiscallink_anaf_client_secret';
 
 import { createEventDeduplicator } from './dedupe';
-import { mapCheckoutToInvoice } from './invoice-map';
+import { buyerAddressGap, mapCheckoutToInvoice } from './invoice-map';
 import type { InvoicePayload, PartyAddress } from './invoice-map';
 
 const app = express();
@@ -583,6 +583,22 @@ app.post('/hooks/app', async (req, res) => {
           detail,
         });
         return res.json({ received: true, skipped: 'issuer-address-missing' });
+      }
+      // Symmetric guard on the buyer side. Checkout only returns a country unless the merchant
+      // enables address collection, and ANAF rejects the document without the buyer street and
+      // city (BR-10/BR-RO-080/BR-RO-090) — a rejection on the merchant's SPV record (and a burnt
+      // quota slot) for data this app cannot invent. Skip, surface it, and let Stripe retry
+      // decide nothing: no retry can conjure an address, so ack the delivery.
+      const buyerGap = buyerAddressGap(full);
+      if (buyerGap) {
+        console.error(`Not filing invoice for ${session.id}: ${buyerGap}`);
+        lastInvoiceError.set(merchantAccountId, {
+          status: 0,
+          session: session.id,
+          at: new Date().toISOString(),
+          detail: buyerGap,
+        });
+        return res.json({ received: true, skipped: 'buyer-address-missing' });
       }
       const issuer = {
         name:
