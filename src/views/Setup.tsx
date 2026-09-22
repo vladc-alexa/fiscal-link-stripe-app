@@ -19,6 +19,14 @@ import {
 import type { ExtensionContextValue } from '@stripe/ui-extension-sdk/context';
 import { signedRequest } from '../helpers/backend';
 
+// The extension host rejects any single string prop longer than 5000 characters, and a
+// backend error body can be arbitrarily long — clamp before it reaches a component.
+const MAX_MESSAGE = 500;
+const safeMessage = (e: unknown): string => {
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg.length > MAX_MESSAGE ? `${msg.slice(0, MAX_MESSAGE)}…` : msg;
+};
+
 interface Status {
   installed: boolean;
   fiscalLinkConnected: boolean;
@@ -49,7 +57,7 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
       const hasAnyConfig = status.fiscalLinkConnected || status.anafConfigured;
       setState(hasAnyConfig ? { kind: 'connected', status } : { kind: 'empty' });
     } catch (e) {
-      setState({ kind: 'error', message: (e as Error).message });
+      setState({ kind: 'error', message: safeMessage(e) });
     }
   };
 
@@ -69,7 +77,7 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
       });
       await loadStatus();
     } catch (e) {
-      setActionError((e as Error).message);
+      setActionError(safeMessage(e));
     } finally {
       setSaving(false);
     }
@@ -86,7 +94,7 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
       setAnafClientSecret('');
       setState({ kind: 'empty' });
     } catch (e) {
-      setActionError((e as Error).message);
+      setActionError(safeMessage(e));
     } finally {
       setSaving(false);
     }
@@ -230,7 +238,7 @@ export const Setup = ({ userContext }: ExtensionContextValue) => {
       <Box css={{ marginTop: 'medium', fontWeight: 'bold' }}>For an invoice ANAF accepts</Box>
       <Box css={{ marginTop: 'xsmall' }}>
         • Collect the buyer's billing address: Payment Links → Options → “Collect billing
-        address” = Required (or Checkout <code>billing_address_collection=required</code>).
+        address” = Required (or set billing_address_collection=required on Checkout).
         Without street and city ANAF rejects the document (BR-10, BR-RO-080, BR-RO-090), so
         FiscalLink skips it and reports it here rather than filing an invalid invoice.
       </Box>
