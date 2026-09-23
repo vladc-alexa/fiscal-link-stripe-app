@@ -51,6 +51,12 @@ const STRIPE_WEBHOOK_SECRET_TEST = process.env.STRIPE_WEBHOOK_SECRET_TEST || '';
 
 // ── Secret Store names (account-scoped) ──────────────────────────────
 const SECRET_REFRESH_TOKEN = 'fiscallink_stripe_refresh_token';
+// Test-mode installs need their own slot: every Stripe object — Secret Store entries included —
+// lives in exactly one mode, and a refresh token minted by a test install can only be refreshed
+// with the test key (and vice versa). Sharing one slot meant the last install clobbered the other
+// mode's token, so test-mode deliveries were retrieved with live credentials (review blocker
+// 2026-09-23).
+const SECRET_REFRESH_TOKEN_TEST = 'fiscallink_stripe_refresh_token_test';
 const SECRET_ACCOUNT_ID = 'fiscallink_stripe_account_id';
 const SECRET_FISCALLINK_KEY = 'fiscallink_api_key';
 const SECRET_ANAF_CIF = 'fiscallink_anaf_cif';
@@ -298,14 +304,83 @@ async function exchangeCodeWithFallback(code: string): Promise<{ tokens: OAuthTo
   throw lastError ?? new Error('OAuth token exchange failed: no API key configured');
 }
 
-async function refreshAccessToken(refreshToken: string) {
+
+// ── Mode handling (live vs test) ──────────────────────────────────────
+// Stripe App events carry the mode they were emitted in, and every object that belongs to an
+// install — Checkout Sessions, Payment Links, and the Secret Store entries themselves — lives in
+// exactly one mode. Serving a test-mode install with the live developer key fails with
+// `No such checkout session: cs_test_… ; a similar object exists in test mode, but a live mode key
+// was used to make this request` — the failure behind five rejected deliveries in the 0.1.6
+// marketplace review (2026-09-23), none of which reached an invoice. Every Stripe call made on
+// behalf of a merchant now goes through the key and secret slot of the mode being served.
+function isLiveSecret(key: string): boolean {
+  return key.startsWith('sk_live') || key.startsWith('rk_live');
+}
+
+function isTestSecret(key: string): boolean {
+  return key.startsWith('sk_test') || key.startsWith('rk_test');
+}
+
+/** Developer key that can serve the given mode; the deployment's primary key is the fallback. */
+function devKeyFor(livemode: boolean): string {
+  if (livemode && !isLiveSecret(STRIPE_SECRET_KEY) && STRIPE_SECRET_KEY_LIVE) return STRIPE_SECRET_KEY_LIVE;
+  if (!livemode && !isTestSecret(STRIPE_SECRET_KEY) && STRIPE_SECRET_KEY_TEST) return STRIPE_SECRET_KEY_TEST;
+  return STRIPE_SECRET_KEY;
+}
+
+/** Secret Store slot holding the OAuth refresh token of a given mode. */
+function refreshTokenName(livemode: boolean): string {
+  return livemode ? SECRET_REFRESH_TOKEN : SECRET_REFRESH_TOKEN_TEST;
+}
+
+/**
+ * Read a secret for a known mode, falling back to the other mode's key so installs created before
+ * the per-mode split stay readable. Failures are logged instead of thrown: a mode mismatch on a
+ * Secret Store read used to surface as a 500 in the app drawer (2026-09-23).
+ */
+async function findSecretForMode(name: string, accountId: string, livemode: boolean): Promise<string | null> {
+  for (const mode of [livemode, !livemode]) {
+    try {
+      const value = await findSecret(name, accountId, devKeyFor(mode));
+      if (value !== null) return value;
+    } catch (e) {
+      console.warn(`[secrets] ${name} read with the ${mode ? 'live' : 'test'} key failed: ${(e as Error).message}`);
+    }
+  }
+  return null;
+}
+
+/**
+ * ANAF validates both parties' addresses, but the app-review flow pays *test-mode* Payment Links:
+ * those collect no buyer address unless the merchant enabled collection, and the tenant's company
+ * record may still be empty. A test-mode document is never filed (core records it with
+ * provider=test and no submission job), so completing it with explicit placeholders is safe — and
+ * lets the reviewer watch a payment become a document instead of a silent skip.
+ */
+const TEST_PLACEHOLDER_ADDRESS: PartyAddress = {
+  street: 'Strada Testului 1',
+  city: 'Bucuresti',
+  postalCode: '010101',
+  country: 'RO',
+  countrySubentity: 'Bucuresti',
+};
+
+function fillAddress(address?: PartyAddress | null): PartyAddress {
+  const merged: Record<string, string> = { ...(TEST_PLACEHOLDER_ADDRESS as Record<string, string>) };
+  for (const [key, value] of Object.entries(address ?? {})) {
+    if (value !== null && value !== undefined && String(value).trim() !== '') merged[key] = String(value);
+  }
+  return merged as PartyAddress;
+}
+
+async function refreshAccessToken(refreshToken: string, apiKey: string) {
   const form = new URLSearchParams();
   form.set('refresh_token', refreshToken);
   form.set('grant_type', 'refresh_token');
   const res = await fetch('https://api.stripe.com/v1/oauth/token', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: form,
@@ -320,12 +395,21 @@ async function refreshAccessToken(refreshToken: string) {
  * /v1/account — an account-scoped token may not call /v1/accounts/{id}, only "me".
  * Stripe rotates the refresh token on every exchange, so the new one must be stored.
  */
-async function merchantAccessToken(accountId: string): Promise<string> {
-  const refreshToken = await findSecret(SECRET_REFRESH_TOKEN, accountId);
-  if (!refreshToken) throw new Error('Not installed: missing OAuth refresh token');
-  const { access_token, refresh_token } = await refreshAccessToken(refreshToken);
-  await setSecret(SECRET_REFRESH_TOKEN, refresh_token, accountId);
-  return access_token;
+async function merchantAccessToken(accountId: string, livemode: boolean): Promise<string> {
+  // Prefer this mode's install; older installs only ever wrote the primary slot.
+  for (const mode of [livemode, !livemode]) {
+    const refreshToken = await findSecretForMode(refreshTokenName(mode), accountId, mode);
+    if (!refreshToken) continue;
+    if (mode !== livemode) {
+      console.warn(
+        `[oauth] no ${livemode ? 'live' : 'test'}-mode refresh token for ${accountId} — using the ${mode ? 'live' : 'test'}-mode install instead`,
+      );
+    }
+    const { access_token, refresh_token } = await refreshAccessToken(refreshToken, devKeyFor(mode));
+    await setSecret(refreshTokenName(mode), refresh_token, accountId, devKeyFor(mode));
+    return access_token;
+  }
+  throw new Error(`Not installed: missing OAuth refresh token for ${accountId}`);
 }
 
 /**
@@ -360,8 +444,12 @@ async function merchantBusinessName(accessToken: string): Promise<string | undef
 async function submitInvoiceToFiscalLink(
   apiKey: string,
   payload: InvoicePayload,
+  options: { testMode?: boolean } = {},
 ): Promise<{ ok: boolean; status: number; body: unknown }> {
-  const res = await fetch(`${CORE_URL}/v1/invoices`, {
+  // A test-mode checkout payment must never reach ANAF: core records such a document for
+  // visibility and skips the submission job (InvoiceService.createAndEnqueue(..., testMode)).
+  const url = `${CORE_URL}/v1/invoices${options.testMode ? '?testMode=true' : ''}`;
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -414,7 +502,7 @@ app.get('/oauth/callback', async (req, res) => {
     // Persist refresh token + account id in the Secret Store (account scope) using
     // the SAME-mode developer key — Secret Store scopes are mode-bound like OAuth.
     console.log(`[oauth] code exchanged → account ${tokens.stripe_user_id} (livemode=${tokens.livemode})`);
-    await setSecret(SECRET_REFRESH_TOKEN, tokens.refresh_token, tokens.stripe_user_id, apiKey);
+    await setSecret(refreshTokenName(tokens.livemode === true), tokens.refresh_token, tokens.stripe_user_id, apiKey);
     await setSecret(SECRET_ACCOUNT_ID, tokens.stripe_user_id, tokens.stripe_user_id, apiKey);
     // state may carry a return path — default to the installed landing page.
     const redirect = state && state.startsWith('/') ? state : '/installed?account=' + tokens.stripe_user_id;
@@ -430,8 +518,8 @@ app.post('/api/status', async (req, res) => {
     const { accountId } = verifyAppSignature(req);
     console.log(`[status] account=${accountId}`);
     const [fiscalLinkKey, cif, webhookOk] = await Promise.all([
-      findSecret(SECRET_FISCALLINK_KEY, accountId),
-      findSecret(SECRET_ANAF_CIF, accountId),
+      findSecretForMode(SECRET_FISCALLINK_KEY, accountId, true),
+      findSecretForMode(SECRET_ANAF_CIF, accountId, true),
       webhookEndpointHealthy(),
     ]);
     console.log(`[status] key=${Boolean(fiscalLinkKey)} cif=${Boolean(cif)} webhook=${webhookOk}`);
@@ -490,6 +578,7 @@ app.post('/api/disconnect', async (req, res) => {
     const { accountId } = verifyAppSignature(req);
     for (const name of [
       SECRET_FISCALLINK_KEY, SECRET_ANAF_CIF, SECRET_ANAF_CLIENT_ID, SECRET_ANAF_CLIENT_SECRET,
+      SECRET_REFRESH_TOKEN, SECRET_REFRESH_TOKEN_TEST,
     ]) {
       // Empty-payload writes are rejected by the Secret Store (parameter_invalid_empty);
       // clearing must go through the delete endpoint (reviewer-caught 2026-09-09).
@@ -541,6 +630,8 @@ app.post('/hooks/app', async (req, res) => {
 
     const merchantAccountId = (event as Stripe.Event & { account?: string }).account || '';
     if (!merchantAccountId) throw new Error('Event missing account (connected merchant)');
+    // The event's own mode picks the developer key and secret slot that serve it.
+    const livemode = event.livemode === true;
 
     if (eventDedupe.isDuplicate(event.id)) {
       console.log(`Duplicate delivery of ${event.id} (${event.type}) for ${merchantAccountId} — already handled`);
@@ -549,8 +640,8 @@ app.post('/hooks/app', async (req, res) => {
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session;
-      const apiKey = await findSecret(SECRET_FISCALLINK_KEY, merchantAccountId);
-      const cif = await findSecret(SECRET_ANAF_CIF, merchantAccountId);
+      const apiKey = await findSecretForMode(SECRET_FISCALLINK_KEY, merchantAccountId, livemode);
+      const cif = await findSecretForMode(SECRET_ANAF_CIF, merchantAccountId, livemode);
       if (!apiKey) {
         console.error(`checkout.session.completed for ${merchantAccountId}: FiscalLink API key not configured`);
         return res.json({ received: true, skipped: 'no-api-key' });
@@ -561,7 +652,7 @@ app.post('/hooks/app', async (req, res) => {
       // ("Having the 'read_only' scope would allow this request"). Plain retrieve
       // and the line_items sub-endpoint are both allowed, so list items separately.
       // One token acquisition for both the SDK client and the plain /v1/account read.
-      const accessToken = await merchantAccessToken(merchantAccountId);
+      const accessToken = await merchantAccessToken(merchantAccountId, livemode);
       const sm = new Stripe(accessToken);
       const [full, lineItemsRes] = await Promise.all([
         sm.checkout.sessions.retrieve(session.id),
@@ -572,7 +663,7 @@ app.post('/hooks/app', async (req, res) => {
       // (BR-08/BR-RO-080/BR-RO-090) and county (BR-RO-110). Refuse to file an invalid
       // document rather than put a rejection on the merchant's SPV record.
       const profile = await fetchIssuerProfile(apiKey);
-      if (!profile?.address) {
+      if (!profile?.address && livemode) {
         const detail =
           'issuer postal address missing: set the company address in FiscalLink — ANAF rejects an e-Factura without the seller address (BR-08, BR-RO-080, BR-RO-090)';
         console.error(`Not filing invoice for ${session.id}: ${detail}`);
@@ -590,7 +681,7 @@ app.post('/hooks/app', async (req, res) => {
       // quota slot) for data this app cannot invent. Skip, surface it, and let Stripe retry
       // decide nothing: no retry can conjure an address, so ack the delivery.
       const buyerGap = buyerAddressGap(full);
-      if (buyerGap) {
+      if (buyerGap && livemode) {
         console.error(`Not filing invoice for ${session.id}: ${buyerGap}`);
         lastInvoiceError.set(merchantAccountId, {
           status: 0,
@@ -600,17 +691,28 @@ app.post('/hooks/app', async (req, res) => {
         });
         return res.json({ received: true, skipped: 'buyer-address-missing' });
       }
+      if (!livemode && (buyerGap || !profile?.address)) {
+        console.warn(
+          `[test-mode] ${session.id}: completing missing party data with placeholders` +
+            `${buyerGap ? ` (${buyerGap})` : ''} — the document is recorded for review and never filed`,
+        );
+      }
       const issuer = {
         name:
-          profile.name ||
+          profile?.name ||
           session.metadata?.merchant_name ||
           (await merchantBusinessName(accessToken)) ||
           'Stripe merchant',
         vatNumber: cif || undefined,
-        address: profile.address,
+        address: profile?.address ?? undefined,
       };
       const invoice = mapCheckoutToInvoice(full, issuer, lineItemsRes.data);
-      const result = await submitInvoiceToFiscalLink(apiKey, invoice);
+      if (!livemode) {
+        // Never filed, so a placeholder cannot become a fiscal document.
+        invoice.issuer.address = fillAddress(invoice.issuer.address);
+        invoice.buyer.address = fillAddress(invoice.buyer.address);
+      }
+      const result = await submitInvoiceToFiscalLink(apiKey, invoice, { testMode: !livemode });
       if (!result.ok) {
         const detail = JSON.stringify(result.body).slice(0, 500);
         console.error(`FiscalLink submission failed (${result.status}) for ${session.id}:`, detail);
@@ -630,7 +732,9 @@ app.post('/hooks/app', async (req, res) => {
         // Ack to stop the retry storm, but leave it in /api/status and the logs.
       } else {
         lastInvoiceError.delete(merchantAccountId);
-        console.log(`Invoice created for ${merchantAccountId} from ${session.id}`);
+        console.log(
+          `${livemode ? 'Invoice' : 'TEST-mode invoice'} recorded for ${merchantAccountId} from ${session.id}`,
+        );
       }
     } else if (event.type === 'account.application.deauthorized') {
       // App uninstalled — clear merchant secrets. The account is already deauthorized, so
@@ -641,7 +745,7 @@ app.post('/hooks/app', async (req, res) => {
       const failures: string[] = [];
       for (const name of [
         SECRET_FISCALLINK_KEY, SECRET_ANAF_CIF, SECRET_ANAF_CLIENT_ID, SECRET_ANAF_CLIENT_SECRET,
-        SECRET_REFRESH_TOKEN, SECRET_ACCOUNT_ID,
+        SECRET_REFRESH_TOKEN, SECRET_REFRESH_TOKEN_TEST, SECRET_ACCOUNT_ID,
       ]) {
         try {
           await deleteSecret(name, merchantAccountId);
